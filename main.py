@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.2",
+    version="0.2.3",
 )
 
 app.add_middleware(
@@ -30,6 +31,7 @@ app.add_middleware(
 
 def limpiar_tickers(activos: List[str]) -> List[str]:
     tickers = []
+
     for activo in activos:
         ticker = str(activo).strip().upper()
         if ticker:
@@ -46,32 +48,52 @@ def limpiar_tickers(activos: List[str]) -> List[str]:
     return tickers_unicos
 
 
-def extraer_serie_cierre_yfinance(data: pd.DataFrame, ticker: str) -> pd.Series:
-    if data.empty:
-        raise ValueError("yfinance no devolvió datos.")
+def descargar_con_yahoo_chart(ticker: str, periodo: str) -> pd.Series:
+    rango = periodo if periodo else "2y"
 
-    if isinstance(data.columns, pd.MultiIndex):
-        posibles = [
-            ("Close", ticker),
-            ("Adj Close", ticker),
-        ]
-        for columna in posibles:
-            if columna in data.columns:
-                serie = data[columna]
-                serie.name = ticker
-                return pd.to_numeric(serie, errors="coerce").dropna()
-    else:
-        if "Close" in data.columns:
-            serie = data["Close"]
-            serie.name = ticker
-            return pd.to_numeric(serie, errors="coerce").dropna()
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
-        if "Adj Close" in data.columns:
-            serie = data["Adj Close"]
-            serie.name = ticker
-            return pd.to_numeric(serie, errors="coerce").dropna()
+    params = {
+        "range": rango,
+        "interval": "1d",
+        "includePrePost": "false",
+        "events": "div,splits",
+    }
 
-    raise ValueError(f"No se encontró columna de cierre para {ticker}.")
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+
+    respuesta = requests.get(url, params=params, headers=headers, timeout=25)
+
+    if respuesta.status_code != 200:
+        raise ValueError(f"Yahoo Chart respondió con estado {respuesta.status_code}: {respuesta.text[:200]}")
+
+    data = respuesta.json()
+
+    result = data.get("chart", {}).get("result")
+
+    if not result:
+        error = data.get("chart", {}).get("error")
+        raise ValueError(f"Yahoo Chart no devolvió resultados. Error: {error}")
+
+    result = result[0]
+    timestamps = result.get("timestamp", [])
+    quote = result.get("indicators", {}).get("quote", [{}])[0]
+    closes = quote.get("close", [])
+
+    if not timestamps or not closes:
+        raise ValueError("Yahoo Chart no devolvió fechas o precios de cierre.")
+
+    fechas = pd.to_datetime(timestamps, unit="s").tz_localize("UTC").tz_convert(None)
+    serie = pd.Series(closes, index=fechas, name=ticker)
+    serie = pd.to_numeric(serie, errors="coerce").dropna()
+
+    if serie.empty or len(serie) < 30:
+        raise ValueError("Yahoo Chart devolvió datos insuficientes.")
+
+    return serie
 
 
 def descargar_con_yfinance(ticker: str, periodo: str) -> pd.Series:
@@ -84,15 +106,45 @@ def descargar_con_yfinance(ticker: str, periodo: str) -> pd.Series:
         threads=False,
     )
 
-    serie = extraer_serie_cierre_yfinance(data, ticker)
+    if data.empty:
+        raise ValueError("yfinance no devolvió datos.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        columnas = data.columns.tolist()
+
+        posibles = [
+            ("Close", ticker),
+            ("Adj Close", ticker),
+        ]
+
+        for columna in posibles:
+            if columna in columnas:
+                serie = data[columna]
+                serie.name = ticker
+                serie = pd.to_numeric(serie, errors="coerce").dropna()
+
+                if not serie.empty:
+                    return serie
+
+        raise ValueError(f"yfinance no encontró columna de cierre. Columnas: {columnas[:10]}")
+
+    if "Close" in data.columns:
+        serie = data["Close"]
+    elif "Adj Close" in data.columns:
+        serie = data["Adj Close"]
+    else:
+        raise ValueError(f"yfinance no encontró columna Close. Columnas: {list(data.columns)}")
+
+    serie.name = ticker
+    serie = pd.to_numeric(serie, errors="coerce").dropna()
 
     if serie.empty:
-        raise ValueError("La serie de yfinance quedó vacía después de limpiar datos.")
+        raise ValueError("yfinance devolvió serie vacía después de limpiar.")
 
     return serie
 
 
-def descargar_con_stooq(ticker: str) -> pd.Series:
+def descargar_con_stooq(ticker: str, periodo: str) -> pd.Series:
     ticker_stooq = ticker.lower()
 
     if "." not in ticker_stooq:
@@ -101,99 +153,99 @@ def descargar_con_stooq(ticker: str) -> pd.Series:
     url = f"https://stooq.com/q/d/l/?s={ticker_stooq}&i=d"
 
     headers = {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/csv,text/plain,*/*",
     }
 
-    respuesta = requests.get(url, headers=headers, timeout=20)
+    respuesta = requests.get(url, headers=headers, timeout=25)
 
     if respuesta.status_code != 200:
-        raise ValueError(f"Stooq respondió con estado {respuesta.status_code}.")
+        raise ValueError(f"Stooq respondió con estado {respuesta.status_code}: {respuesta.text[:200]}")
 
-    from io import StringIO
+    texto = respuesta.text.strip()
 
-    data = pd.read_csv(StringIO(respuesta.text))
+    if not texto or "No data" in texto:
+        raise ValueError(f"Stooq no devolvió datos. Respuesta: {texto[:200]}")
 
-    if data.empty or "Close" not in data.columns:
-        raise ValueError("Stooq no devolvió datos válidos.")
+    data = pd.read_csv(StringIO(texto))
+
+    if data.empty:
+        raise ValueError(f"Stooq devolvió CSV vacío. Respuesta: {texto[:200]}")
+
+    data.columns = [str(col).strip().title() for col in data.columns]
+
+    if "Date" not in data.columns or "Close" not in data.columns:
+        raise ValueError(f"Stooq no devolvió columnas válidas. Columnas: {list(data.columns)}. Respuesta: {texto[:200]}")
 
     data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    data["Close"] = pd.to_numeric(data["Close"], errors="coerce")
     data = data.dropna(subset=["Date", "Close"])
     data = data.set_index("Date").sort_index()
 
-    serie = pd.to_numeric(data["Close"], errors="coerce").dropna()
+    serie = data["Close"]
     serie.name = ticker
 
-    if serie.empty:
-        raise ValueError("La serie de Stooq quedó vacía después de limpiar datos.")
-
-    return serie
-
-
-def filtrar_periodo(serie: pd.Series, periodo: str) -> pd.Series:
     if periodo.endswith("y"):
         anios = int(periodo.replace("y", ""))
         fecha_inicio = serie.index.max() - pd.DateOffset(years=anios)
-        return serie[serie.index >= fecha_inicio]
+        serie = serie[serie.index >= fecha_inicio]
 
-    if periodo.endswith("mo"):
-        meses = int(periodo.replace("mo", ""))
-        fecha_inicio = serie.index.max() - pd.DateOffset(months=meses)
-        return serie[serie.index >= fecha_inicio]
+    if serie.empty or len(serie) < 30:
+        raise ValueError("Stooq devolvió datos insuficientes después de filtrar periodo.")
 
     return serie
 
 
-def obtener_precios(activos: List[str], periodo: str = "2y") -> pd.DataFrame:
-    series = []
+def descargar_precio_activo(ticker: str, periodo: str) -> Dict[str, Any]:
     errores = {}
 
-    for ticker in activos:
+    fuentes = [
+        ("yahoo_chart", descargar_con_yahoo_chart),
+        ("yfinance", descargar_con_yfinance),
+        ("stooq", descargar_con_stooq),
+    ]
+
+    for nombre_fuente, funcion in fuentes:
         try:
-            serie = descargar_con_yfinance(ticker, periodo)
-            fuente = "yfinance"
-        except Exception as error_yahoo:
-            try:
-                serie = descargar_con_stooq(ticker)
-                serie = filtrar_periodo(serie, periodo)
-                fuente = "stooq"
-            except Exception as error_stooq:
-                errores[ticker] = {
-                    "yfinance": str(error_yahoo),
-                    "stooq": str(error_stooq),
-                }
-                continue
-
-        if serie.empty or len(serie) < 30:
-            errores[ticker] = {
-                "mensaje": f"No hay suficientes datos para {ticker}.",
-                "fuente": fuente,
-                "observaciones": int(len(serie)),
+            serie = funcion(ticker, periodo)
+            return {
+                "ticker": ticker,
+                "fuente": nombre_fuente,
+                "serie": serie,
             }
-            continue
+        except Exception as error:
+            errores[nombre_fuente] = str(error)
 
-        series.append(serie)
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "mensaje": f"No se pudieron obtener datos para el activo {ticker}.",
+            "errores": errores,
+        },
+    )
 
-    if not series:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "mensaje": "No se pudieron obtener datos históricos para los activos enviados.",
-                "errores": errores,
-            },
-        )
+
+def obtener_precios(activos: List[str], periodo: str = "2y") -> Dict[str, Any]:
+    series = []
+    fuentes_utilizadas = {}
+
+    for ticker in activos:
+        resultado = descargar_precio_activo(ticker, periodo)
+        series.append(resultado["serie"])
+        fuentes_utilizadas[ticker] = resultado["fuente"]
 
     precios_df = pd.concat(series, axis=1).dropna()
 
     if precios_df.empty or len(precios_df) < 30:
         raise HTTPException(
             status_code=400,
-            detail={
-                "mensaje": "No hay suficientes datos históricos comunes para calcular el análisis.",
-                "errores": errores,
-            },
+            detail="No hay suficientes datos históricos comunes para calcular el análisis.",
         )
 
-    return precios_df
+    return {
+        "precios": precios_df,
+        "fuentes_utilizadas": fuentes_utilizadas,
+    }
 
 
 def obtener_pesos(payload: Dict[str, Any], activos: List[str]) -> np.ndarray:
@@ -206,10 +258,7 @@ def obtener_pesos(payload: Dict[str, Any], activos: List[str]) -> np.ndarray:
         raise HTTPException(status_code=400, detail="El campo 'pesos' debe ser una lista de números.")
 
     if len(pesos_recibidos) != len(activos):
-        raise HTTPException(
-            status_code=400,
-            detail="La cantidad de pesos debe coincidir con la cantidad de activos.",
-        )
+        raise HTTPException(status_code=400, detail="La cantidad de pesos debe coincidir con la cantidad de activos.")
 
     pesos = np.array(pesos_recibidos, dtype=float)
 
@@ -261,21 +310,16 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
     activos = limpiar_tickers(payload.get("activos", []))
     periodo = str(payload.get("periodo", "2y"))
 
-    precios = obtener_precios(activos, periodo)
+    resultado_precios = obtener_precios(activos, periodo)
+    precios = resultado_precios["precios"]
+    fuentes_utilizadas = resultado_precios["fuentes_utilizadas"]
+
     pesos = obtener_pesos(payload, activos)
-
-    activos_validos = list(precios.columns)
-
-    if len(pesos) != len(activos_validos):
-        pesos = np.array([1 / len(activos_validos)] * len(activos_validos))
 
     retornos_diarios = precios.pct_change().dropna()
 
     if retornos_diarios.empty:
-        raise HTTPException(
-            status_code=400,
-            detail="No fue posible calcular retornos diarios con los datos disponibles.",
-        )
+        raise HTTPException(status_code=400, detail="No fue posible calcular retornos diarios.")
 
     retornos_portafolio = retornos_diarios.dot(pesos)
 
@@ -300,7 +344,7 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pesos_dict = {
         activo: round(float(peso), 4)
-        for activo, peso in zip(activos_validos, pesos)
+        for activo, peso in zip(activos, pesos)
     }
 
     explicacion = generar_explicacion(
@@ -309,15 +353,16 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
         max_drawdown=max_drawdown,
         var_95=var_95,
         cvar_95=cvar_95,
-        activos=activos_validos,
+        activos=activos,
     )
 
     return {
-        "activos": activos_validos,
+        "activos": activos,
         "periodo": periodo,
         "fecha_inicio": str(precios.index.min().date()),
         "fecha_fin": str(precios.index.max().date()),
         "numero_observaciones": int(len(precios)),
+        "fuentes_utilizadas": fuentes_utilizadas,
         "pesos_utilizados": pesos_dict,
         "metricas_portafolio": {
             "rentabilidad_anualizada": round(rentabilidad_anual, 6),
@@ -340,7 +385,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.2",
+        "version": "0.2.3",
     }
 
 
@@ -349,7 +394,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -357,41 +402,35 @@ def health():
 @app.get("/diagnostico-activo/{ticker}")
 def diagnostico_activo(ticker: str):
     ticker = ticker.upper()
+    periodo = "1y"
 
     resultado = {
         "ticker": ticker,
-        "yfinance": None,
-        "stooq": None,
+        "periodo": periodo,
+        "fuentes": {},
     }
 
-    try:
-        serie_yahoo = descargar_con_yfinance(ticker, "1y")
-        resultado["yfinance"] = {
-            "status": "ok",
-            "observaciones": int(len(serie_yahoo)),
-            "fecha_inicio": str(serie_yahoo.index.min().date()),
-            "fecha_fin": str(serie_yahoo.index.max().date()),
-        }
-    except Exception as error:
-        resultado["yfinance"] = {
-            "status": "error",
-            "detalle": str(error),
-        }
+    pruebas = [
+        ("yahoo_chart", descargar_con_yahoo_chart),
+        ("yfinance", descargar_con_yfinance),
+        ("stooq", descargar_con_stooq),
+    ]
 
-    try:
-        serie_stooq = descargar_con_stooq(ticker)
-        serie_stooq = filtrar_periodo(serie_stooq, "1y")
-        resultado["stooq"] = {
-            "status": "ok",
-            "observaciones": int(len(serie_stooq)),
-            "fecha_inicio": str(serie_stooq.index.min().date()),
-            "fecha_fin": str(serie_stooq.index.max().date()),
-        }
-    except Exception as error:
-        resultado["stooq"] = {
-            "status": "error",
-            "detalle": str(error),
-        }
+    for nombre, funcion in pruebas:
+        try:
+            serie = funcion(ticker, periodo)
+            resultado["fuentes"][nombre] = {
+                "status": "ok",
+                "observaciones": int(len(serie)),
+                "fecha_inicio": str(serie.index.min().date()),
+                "fecha_fin": str(serie.index.max().date()),
+                "ultimo_precio": round(float(serie.iloc[-1]), 4),
+            }
+        except Exception as error:
+            resultado["fuentes"][nombre] = {
+                "status": "error",
+                "detalle": str(error),
+            }
 
     return resultado
 
@@ -448,6 +487,7 @@ def calcular_riesgo(payload: Dict[str, Any]):
         "resultado": {
             "activos": resultado["activos"],
             "periodo": resultado["periodo"],
+            "fuentes_utilizadas": resultado["fuentes_utilizadas"],
             "volatilidad_anualizada": metricas["volatilidad_anualizada"],
             "max_drawdown": metricas["max_drawdown"],
             "var_95_historico_diario": metricas["var_95_historico_diario"],
