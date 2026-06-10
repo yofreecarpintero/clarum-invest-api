@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.1",
+    version="0.2.2",
 )
 
 app.add_middleware(
@@ -20,7 +21,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"https://.*\.lovable\.app",
+    allow_origin_regex=r"https://.*\\.lovable\\.app",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,7 +30,6 @@ app.add_middleware(
 
 def limpiar_tickers(activos: List[str]) -> List[str]:
     tickers = []
-
     for activo in activos:
         ticker = str(activo).strip().upper()
         if ticker:
@@ -38,99 +38,159 @@ def limpiar_tickers(activos: List[str]) -> List[str]:
     tickers_unicos = list(dict.fromkeys(tickers))
 
     if len(tickers_unicos) < 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Debes enviar al menos un activo válido."
-        )
+        raise HTTPException(status_code=400, detail="Debes enviar al menos un activo válido.")
 
     if len(tickers_unicos) > 10:
-        raise HTTPException(
-            status_code=400,
-            detail="Por ahora el análisis permite máximo 10 activos."
-        )
+        raise HTTPException(status_code=400, detail="Por ahora el análisis permite máximo 10 activos.")
 
     return tickers_unicos
 
 
-def extraer_serie_cierre(data: pd.DataFrame, ticker: str) -> pd.Series:
+def extraer_serie_cierre_yfinance(data: pd.DataFrame, ticker: str) -> pd.Series:
     if data.empty:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No se encontraron datos para el activo {ticker}."
-        )
+        raise ValueError("yfinance no devolvió datos.")
 
     if isinstance(data.columns, pd.MultiIndex):
-        if ("Close", ticker) in data.columns:
-            serie = data[("Close", ticker)]
-        elif ("Adj Close", ticker) in data.columns:
-            serie = data[("Adj Close", ticker)]
-        else:
-            columnas_disponibles = [str(col) for col in data.columns.tolist()]
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "mensaje": f"No se encontró columna de cierre para {ticker}.",
-                    "columnas_disponibles": columnas_disponibles,
-                },
-            )
+        posibles = [
+            ("Close", ticker),
+            ("Adj Close", ticker),
+        ]
+        for columna in posibles:
+            if columna in data.columns:
+                serie = data[columna]
+                serie.name = ticker
+                return pd.to_numeric(serie, errors="coerce").dropna()
     else:
         if "Close" in data.columns:
             serie = data["Close"]
-        elif "Adj Close" in data.columns:
-            serie = data["Adj Close"]
-        else:
-            columnas_disponibles = [str(col) for col in data.columns.tolist()]
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "mensaje": f"No se encontró columna de cierre para {ticker}.",
-                    "columnas_disponibles": columnas_disponibles,
-                },
-            )
+            serie.name = ticker
+            return pd.to_numeric(serie, errors="coerce").dropna()
 
-    serie = pd.to_numeric(serie, errors="coerce").dropna()
+        if "Adj Close" in data.columns:
+            serie = data["Adj Close"]
+            serie.name = ticker
+            return pd.to_numeric(serie, errors="coerce").dropna()
+
+    raise ValueError(f"No se encontró columna de cierre para {ticker}.")
+
+
+def descargar_con_yfinance(ticker: str, periodo: str) -> pd.Series:
+    data = yf.download(
+        ticker,
+        period=periodo,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+
+    serie = extraer_serie_cierre_yfinance(data, ticker)
 
     if serie.empty:
-        raise HTTPException(
-            status_code=400,
-            detail=f"La serie de precios para {ticker} está vacía después de limpiar los datos."
-        )
+        raise ValueError("La serie de yfinance quedó vacía después de limpiar datos.")
 
+    return serie
+
+
+def descargar_con_stooq(ticker: str) -> pd.Series:
+    ticker_stooq = ticker.lower()
+
+    if "." not in ticker_stooq:
+        ticker_stooq = f"{ticker_stooq}.us"
+
+    url = f"https://stooq.com/q/d/l/?s={ticker_stooq}&i=d"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    respuesta = requests.get(url, headers=headers, timeout=20)
+
+    if respuesta.status_code != 200:
+        raise ValueError(f"Stooq respondió con estado {respuesta.status_code}.")
+
+    from io import StringIO
+
+    data = pd.read_csv(StringIO(respuesta.text))
+
+    if data.empty or "Close" not in data.columns:
+        raise ValueError("Stooq no devolvió datos válidos.")
+
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    data = data.dropna(subset=["Date", "Close"])
+    data = data.set_index("Date").sort_index()
+
+    serie = pd.to_numeric(data["Close"], errors="coerce").dropna()
     serie.name = ticker
+
+    if serie.empty:
+        raise ValueError("La serie de Stooq quedó vacía después de limpiar datos.")
+
+    return serie
+
+
+def filtrar_periodo(serie: pd.Series, periodo: str) -> pd.Series:
+    if periodo.endswith("y"):
+        anios = int(periodo.replace("y", ""))
+        fecha_inicio = serie.index.max() - pd.DateOffset(years=anios)
+        return serie[serie.index >= fecha_inicio]
+
+    if periodo.endswith("mo"):
+        meses = int(periodo.replace("mo", ""))
+        fecha_inicio = serie.index.max() - pd.DateOffset(months=meses)
+        return serie[serie.index >= fecha_inicio]
+
     return serie
 
 
 def obtener_precios(activos: List[str], periodo: str = "2y") -> pd.DataFrame:
     series = []
+    errores = {}
 
     for ticker in activos:
         try:
-            data = yf.download(
-                ticker,
-                period=periodo,
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
+            serie = descargar_con_yfinance(ticker, periodo)
+            fuente = "yfinance"
+        except Exception as error_yahoo:
+            try:
+                serie = descargar_con_stooq(ticker)
+                serie = filtrar_periodo(serie, periodo)
+                fuente = "stooq"
+            except Exception as error_stooq:
+                errores[ticker] = {
+                    "yfinance": str(error_yahoo),
+                    "stooq": str(error_stooq),
+                }
+                continue
 
-            serie = extraer_serie_cierre(data, ticker)
-            series.append(serie)
+        if serie.empty or len(serie) < 30:
+            errores[ticker] = {
+                "mensaje": f"No hay suficientes datos para {ticker}.",
+                "fuente": fuente,
+                "observaciones": int(len(serie)),
+            }
+            continue
 
-        except HTTPException:
-            raise
-        except Exception as error:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error descargando datos de {ticker}: {str(error)}"
-            )
+        series.append(serie)
+
+    if not series:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "mensaje": "No se pudieron obtener datos históricos para los activos enviados.",
+                "errores": errores,
+            },
+        )
 
     precios_df = pd.concat(series, axis=1).dropna()
 
     if precios_df.empty or len(precios_df) < 30:
         raise HTTPException(
             status_code=400,
-            detail="No hay suficientes datos históricos para calcular el análisis."
+            detail={
+                "mensaje": "No hay suficientes datos históricos comunes para calcular el análisis.",
+                "errores": errores,
+            },
         )
 
     return precios_df
@@ -143,32 +203,23 @@ def obtener_pesos(payload: Dict[str, Any], activos: List[str]) -> np.ndarray:
         return np.array([1 / len(activos)] * len(activos))
 
     if not isinstance(pesos_recibidos, list):
-        raise HTTPException(
-            status_code=400,
-            detail="El campo 'pesos' debe ser una lista de números."
-        )
+        raise HTTPException(status_code=400, detail="El campo 'pesos' debe ser una lista de números.")
 
     if len(pesos_recibidos) != len(activos):
         raise HTTPException(
             status_code=400,
-            detail="La cantidad de pesos debe coincidir con la cantidad de activos."
+            detail="La cantidad de pesos debe coincidir con la cantidad de activos.",
         )
 
     pesos = np.array(pesos_recibidos, dtype=float)
 
     if np.any(pesos < 0):
-        raise HTTPException(
-            status_code=400,
-            detail="Los pesos no pueden ser negativos."
-        )
+        raise HTTPException(status_code=400, detail="Los pesos no pueden ser negativos.")
 
     suma_pesos = pesos.sum()
 
     if suma_pesos <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="La suma de los pesos debe ser mayor que cero."
-        )
+        raise HTTPException(status_code=400, detail="La suma de los pesos debe ser mayor que cero.")
 
     return pesos / suma_pesos
 
@@ -201,12 +252,8 @@ def generar_explicacion(
         f"muestra cuánto habría crecido el portafolio en promedio anual según los datos "
         f"históricos, mientras que la volatilidad indica qué tanto pueden variar sus resultados. "
         f"Con base en la volatilidad observada, el nivel de riesgo histórico se clasifica como "
-        f"{nivel_riesgo}. El máximo drawdown fue de {drawdown_pct:.2f}%, que representa "
-        f"la mayor caída histórica desde un punto alto hasta un punto bajo dentro del periodo "
-        f"analizado. El VaR histórico diario al 95% fue de {var_pct:.2f}%, lo que significa que, "
-        f"en condiciones normales de mercado, la pérdida diaria no debería superar ese porcentaje "
-        f"en aproximadamente 95 de cada 100 días. El CVaR fue de {cvar_pct:.2f}%, y representa "
-        f"una estimación de la pérdida promedio en los peores escenarios observados."
+        f"{nivel_riesgo}. El máximo drawdown fue de {drawdown_pct:.2f}%. El VaR histórico "
+        f"diario al 95% fue de {var_pct:.2f}% y el CVaR fue de {cvar_pct:.2f}%."
     )
 
 
@@ -217,12 +264,17 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
     precios = obtener_precios(activos, periodo)
     pesos = obtener_pesos(payload, activos)
 
+    activos_validos = list(precios.columns)
+
+    if len(pesos) != len(activos_validos):
+        pesos = np.array([1 / len(activos_validos)] * len(activos_validos))
+
     retornos_diarios = precios.pct_change().dropna()
 
     if retornos_diarios.empty:
         raise HTTPException(
             status_code=400,
-            detail="No fue posible calcular retornos diarios con los datos disponibles."
+            detail="No fue posible calcular retornos diarios con los datos disponibles.",
         )
 
     retornos_portafolio = retornos_diarios.dot(pesos)
@@ -243,17 +295,12 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     correlacion = retornos_diarios.corr().round(4).to_dict()
 
-    rentabilidades_individuales = (
-        retornos_diarios.mean() * 252
-    ).round(6).to_dict()
-
-    volatilidades_individuales = (
-        retornos_diarios.std() * np.sqrt(252)
-    ).round(6).to_dict()
+    rentabilidades_individuales = (retornos_diarios.mean() * 252).round(6).to_dict()
+    volatilidades_individuales = (retornos_diarios.std() * np.sqrt(252)).round(6).to_dict()
 
     pesos_dict = {
         activo: round(float(peso), 4)
-        for activo, peso in zip(activos, pesos)
+        for activo, peso in zip(activos_validos, pesos)
     }
 
     explicacion = generar_explicacion(
@@ -262,11 +309,11 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
         max_drawdown=max_drawdown,
         var_95=var_95,
         cvar_95=cvar_95,
-        activos=activos,
+        activos=activos_validos,
     )
 
     return {
-        "activos": activos,
+        "activos": activos_validos,
         "periodo": periodo,
         "fecha_inicio": str(precios.index.min().date()),
         "fecha_fin": str(precios.index.max().date()),
@@ -293,7 +340,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.1",
+        "version": "0.2.2",
     }
 
 
@@ -302,9 +349,51 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.1",
+        "version": "0.2.2",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/diagnostico-activo/{ticker}")
+def diagnostico_activo(ticker: str):
+    ticker = ticker.upper()
+
+    resultado = {
+        "ticker": ticker,
+        "yfinance": None,
+        "stooq": None,
+    }
+
+    try:
+        serie_yahoo = descargar_con_yfinance(ticker, "1y")
+        resultado["yfinance"] = {
+            "status": "ok",
+            "observaciones": int(len(serie_yahoo)),
+            "fecha_inicio": str(serie_yahoo.index.min().date()),
+            "fecha_fin": str(serie_yahoo.index.max().date()),
+        }
+    except Exception as error:
+        resultado["yfinance"] = {
+            "status": "error",
+            "detalle": str(error),
+        }
+
+    try:
+        serie_stooq = descargar_con_stooq(ticker)
+        serie_stooq = filtrar_periodo(serie_stooq, "1y")
+        resultado["stooq"] = {
+            "status": "ok",
+            "observaciones": int(len(serie_stooq)),
+            "fecha_inicio": str(serie_stooq.index.min().date()),
+            "fecha_fin": str(serie_stooq.index.max().date()),
+        }
+    except Exception as error:
+        resultado["stooq"] = {
+            "status": "error",
+            "detalle": str(error),
+        }
+
+    return resultado
 
 
 @app.post("/perfil-inversionista")
