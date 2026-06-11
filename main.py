@@ -1968,7 +1968,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         "Los cálculos se basan en datos históricos y tienen finalidad académica. "
         "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
     ),
-}
+    }
 
 return limpiar_valores_json(respuesta)
 
