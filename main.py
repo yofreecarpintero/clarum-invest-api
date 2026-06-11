@@ -1931,7 +1931,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         activos=tickers,
     )
 
-   respuesta = {
+    respuesta = {
     "status": "ok",
     "modulo": "portfolio-simulate",
     "validation": validacion,
