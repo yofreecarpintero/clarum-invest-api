@@ -1970,7 +1970,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
     ),
     }
 
-return limpiar_valores_json(respuesta)
+    return limpiar_valores_json(respuesta)
 
     #=============================================================
 
