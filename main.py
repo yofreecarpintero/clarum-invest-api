@@ -1947,4 +1947,4 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
             "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
         ),
     }
-    =============================================================
+    #=============================================================
