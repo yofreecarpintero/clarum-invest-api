@@ -912,10 +912,6 @@ def obtener_matriz_riesgo_conocimiento():
 # MÓDULO CATÁLOGO MAESTRO DE ACTIVOS Y FILTRO POR PERFIL
 # ============================================================
 
-from pydantic import BaseModel
-from typing import Optional
-
-
 class AllowedAssetsRequest(BaseModel):
     resultado: Optional[Dict[str, Any]] = None
     restricciones: Optional[Dict[str, Any]] = None
@@ -1329,3 +1325,255 @@ def obtener_catalogo_activos():
     }
 
 #==================================================
+
+# ============================================================
+# MÓDULO VALIDACIÓN DE PORTAFOLIO SEGÚN RESTRICCIONES
+# ============================================================
+
+class PortfolioValidationRequest(BaseModel):
+    resultado: Optional[Dict[str, Any]] = None
+    selected_assets: List[Dict[str, Any]]
+    weights: Optional[Dict[str, float]] = None
+
+
+def obtener_clase_general_activo(asset_class: str) -> str:
+    clase = str(asset_class).lower()
+
+    if "renta fija" in clase:
+        return "renta_fija"
+
+    if "renta variable" in clase or "acciones individuales" in clase:
+        return "renta_variable"
+
+    return "otro"
+
+
+def validar_activo_con_catalogo(ticker: str) -> Optional[Dict[str, Any]]:
+    ticker_norm = str(ticker).strip().upper()
+
+    for activo in ASSET_CATALOG:
+        if activo["ticker"].upper() == ticker_norm:
+            return activo
+
+    return None
+
+
+def normalizar_pesos_portafolio(
+    selected_assets: List[Dict[str, Any]],
+    weights: Optional[Dict[str, float]],
+) -> Dict[str, float]:
+
+    tickers = [str(asset.get("ticker", "")).upper() for asset in selected_assets]
+
+    if not weights:
+        peso_igual = round(100 / len(tickers), 6)
+        return {ticker: peso_igual for ticker in tickers}
+
+    pesos_limpios = {}
+
+    for ticker in tickers:
+        peso = weights.get(ticker)
+
+        if peso is None:
+            peso = weights.get(ticker.lower())
+
+        if peso is None:
+            peso = 0
+
+        try:
+            peso_float = float(peso)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El peso del activo {ticker} no es un número válido.",
+            )
+
+        pesos_limpios[ticker] = peso_float
+
+    return pesos_limpios
+
+
+@app.post("/api/portfolio/validate-selection")
+def validar_portafolio_academico(request: PortfolioValidationRequest):
+    if not request.selected_assets:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes enviar al menos un activo seleccionado.",
+        )
+
+    if len(request.selected_assets) > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="El MVP académico permite máximo 10 activos por portafolio.",
+        )
+
+    if not request.resultado:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes enviar el resultado del perfil académico para validar restricciones.",
+        )
+
+    perfil_riesgo = request.resultado.get("perfil_riesgo")
+    nivel_conocimiento = request.resultado.get("nivel_conocimiento")
+
+    restricciones = request.resultado.get("restricciones")
+
+    if not restricciones and perfil_riesgo and nivel_conocimiento:
+        restricciones = obtener_restricciones_academicas(
+            risk_profile=perfil_riesgo,
+            knowledge_level=nivel_conocimiento,
+        )
+
+    if not restricciones:
+        raise HTTPException(
+            status_code=400,
+            detail="No fue posible obtener restricciones del perfil académico.",
+        )
+
+    allowed_classes = restricciones.get("allowed_asset_classes", [])
+    max_equity = float(restricciones.get("max_equity_percentage", 0))
+    min_fixed_income = float(restricciones.get("min_fixed_income_percentage", 0))
+    max_weight_per_asset = float(restricciones.get("max_weight_per_asset", 0))
+    short_allowed = bool(restricciones.get("short_positions_allowed", False))
+    leverage_allowed = bool(restricciones.get("leverage_allowed", False))
+
+    errors = []
+    warnings = []
+
+    pesos = normalizar_pesos_portafolio(
+        selected_assets=request.selected_assets,
+        weights=request.weights,
+    )
+
+    suma_pesos = round(sum(pesos.values()), 6)
+
+    if not leverage_allowed and suma_pesos > 100.0001:
+        errors.append(
+            f"La suma de los pesos es {suma_pesos:.2f}%, superior al 100%. "
+            "El perfil no permite apalancamiento."
+        )
+
+    if abs(suma_pesos - 100) > 0.01:
+        errors.append(
+            f"La suma de los pesos debe ser 100%. Actualmente es {suma_pesos:.2f}%."
+        )
+
+    renta_variable_total = 0.0
+    renta_fija_total = 0.0
+    otros_total = 0.0
+
+    activos_validados = []
+
+    for asset in request.selected_assets:
+        ticker = str(asset.get("ticker", "")).upper().strip()
+
+        if not ticker:
+            errors.append("Existe un activo seleccionado sin ticker.")
+            continue
+
+        catalog_asset = validar_activo_con_catalogo(ticker)
+
+        if not catalog_asset:
+            errors.append(
+                f"El activo {ticker} no existe en el catálogo maestro académico."
+            )
+            continue
+
+        asset_class = catalog_asset["asset_class"]
+
+        if not clase_activo_permitida(asset_class, allowed_classes):
+            errors.append(
+                f"El activo {ticker} ({asset_class}) no está permitido para el perfil actual."
+            )
+
+        peso = pesos.get(ticker, 0)
+
+        if peso < 0 and not short_allowed:
+            errors.append(
+                f"El activo {ticker} tiene peso negativo. Las posiciones cortas no están permitidas."
+            )
+
+        max_weight_asset = float(asset.get("max_weight_allowed", max_weight_per_asset))
+
+        if asset_class == "Acciones individuales de alta volatilidad":
+            max_weight_asset = min(max_weight_asset, 10)
+
+        if peso > max_weight_asset + 0.0001:
+            errors.append(
+                f"El activo {ticker} tiene un peso de {peso:.2f}%, "
+                f"pero su máximo permitido es {max_weight_asset:.2f}%."
+            )
+
+        clase_general = obtener_clase_general_activo(asset_class)
+
+        if clase_general == "renta_variable":
+            renta_variable_total += peso
+        elif clase_general == "renta_fija":
+            renta_fija_total += peso
+        else:
+            otros_total += peso
+
+        activos_validados.append({
+            **catalog_asset,
+            "assigned_weight": round(peso, 4),
+            "max_weight_allowed": round(max_weight_asset, 4),
+            "general_class": clase_general,
+        })
+
+    if renta_variable_total > max_equity + 0.0001:
+        errors.append(
+            f"La exposición total a renta variable es {renta_variable_total:.2f}%, "
+            f"pero el máximo permitido para este perfil es {max_equity:.2f}%."
+        )
+
+    if renta_fija_total < min_fixed_income - 0.0001:
+        warnings.append(
+            f"La exposición a renta fija es {renta_fija_total:.2f}%, "
+            f"mientras que la mínima sugerida para este perfil es {min_fixed_income:.2f}%."
+        )
+
+    if len(request.selected_assets) < 2:
+        warnings.append(
+            "El portafolio tiene menos de dos activos. Esto limita la diversificación académica."
+        )
+
+    is_valid = len(errors) == 0
+
+    if is_valid:
+        mensaje = (
+            "El portafolio propuesto cumple las restricciones principales del perfil académico. "
+            "Puede avanzar al simulador para calcular métricas históricas de rentabilidad y riesgo. "
+            "Este resultado no constituye una recomendación personalizada de inversión."
+        )
+    else:
+        mensaje = (
+            "El portafolio propuesto no cumple una o más restricciones académicas del perfil. "
+            "Ajusta los pesos o cambia los activos seleccionados antes de continuar al simulador."
+        )
+
+    return {
+        "status": "ok",
+        "modulo": "portfolio-validate-selection",
+        "is_valid": is_valid,
+        "errors": errors,
+        "warnings": warnings,
+        "normalized_weights": pesos,
+        "portfolio_summary": {
+            "numero_activos": len(request.selected_assets),
+            "suma_pesos": round(suma_pesos, 4),
+            "renta_variable_total": round(renta_variable_total, 4),
+            "renta_fija_total": round(renta_fija_total, 4),
+            "otros_total": round(otros_total, 4),
+            "max_equity_allowed": max_equity,
+            "min_fixed_income_suggested": min_fixed_income,
+            "max_weight_per_asset": max_weight_per_asset,
+        },
+        "validated_assets": activos_validados,
+        "mensaje_academico": mensaje,
+        "advertencia": (
+            "La validación tiene finalidad académica y simulativa. "
+            "No constituye asesoría financiera personalizada."
+        ),
+    }
+
+#==========================================================================
