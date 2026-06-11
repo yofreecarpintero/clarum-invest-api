@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from io import StringIO
 
 import numpy as np
@@ -8,6 +8,7 @@ import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 
 app = FastAPI(
@@ -30,6 +31,364 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
+# MÓDULO PERFIL ACADÉMICO, ENCUESTA Y MATRIZ DE RESTRICCIONES
+# ============================================================
+
+class ProfileRequest(BaseModel):
+    respuestas: Optional[List[str]] = None
+    answers: Optional[Dict[str, str]] = None
+
+
+RISK_QUESTIONS = ["q1", "q2", "q3", "q4", "q5"]
+KNOWLEDGE_QUESTIONS = ["q6", "q7", "q8", "q9", "q10"]
+
+ANSWER_SCORE = {
+    "A": 1,
+    "B": 2,
+    "C": 3,
+    "D": 4,
+}
+
+
+RISK_KNOWLEDGE_MATRIX = {
+    "Conservador": {
+        "Básico": "Protección alta",
+        "Intermedio": "Protección moderada",
+        "Avanzado": "Protección flexible",
+    },
+    "Moderado": {
+        "Básico": "Crecimiento limitado",
+        "Intermedio": "Crecimiento prudente",
+        "Avanzado": "Crecimiento balanceado",
+    },
+    "Dinámico": {
+        "Básico": "Riesgo condicionado",
+        "Intermedio": "Crecimiento dinámico controlado",
+        "Avanzado": "Crecimiento dinámico",
+    },
+    "Agresivo": {
+        "Básico": "Riesgo no habilitado",
+        "Intermedio": "Riesgo alto restringido",
+        "Avanzado": "Riesgo alto permitido",
+    },
+}
+
+
+def normalizar_respuestas_perfil(request: ProfileRequest) -> Dict[str, str]:
+    """
+    Permite recibir las respuestas en dos formatos:
+    1. Formato Lovable:
+       {"respuestas": ["A","B","C","D","A","B","C","D","A","B"]}
+
+    2. Formato estructurado:
+       {"answers": {"q1": "A", "q2": "B", ...}}
+    """
+
+    if request.answers:
+        return request.answers
+
+    if request.respuestas:
+        if len(request.respuestas) != 10:
+            raise HTTPException(
+                status_code=400,
+                detail="La encuesta debe contener exactamente 10 respuestas.",
+            )
+
+        return {
+            f"q{index + 1}": answer
+            for index, answer in enumerate(request.respuestas)
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail="El cuerpo de la solicitud debe incluir 'respuestas' o 'answers'.",
+    )
+
+
+def calcular_puntaje_perfil(answers: Dict[str, str], questions: List[str]) -> int:
+    total = 0
+
+    for question in questions:
+        answer = str(answers.get(question, "")).strip().upper()
+
+        if answer not in ANSWER_SCORE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"La respuesta de {question} no es válida. Debe ser A, B, C o D.",
+            )
+
+        total += ANSWER_SCORE[answer]
+
+    return total
+
+
+def clasificar_perfil_riesgo(score: int) -> str:
+    if score <= 8:
+        return "Conservador"
+    elif score <= 12:
+        return "Moderado"
+    elif score <= 16:
+        return "Dinámico"
+    return "Agresivo"
+
+
+def clasificar_nivel_conocimiento(score: int) -> str:
+    if score <= 8:
+        return "Básico"
+    elif score <= 14:
+        return "Intermedio"
+    return "Avanzado"
+
+
+def obtener_restricciones_academicas(
+    risk_profile: str,
+    knowledge_level: str,
+) -> Dict[str, Any]:
+
+    matrix_category = RISK_KNOWLEDGE_MATRIX[risk_profile][knowledge_level]
+
+    restrictions = {
+        "categoria_matriz": matrix_category,
+        "allowed_asset_classes": [],
+        "blocked_asset_classes": [
+            "Derivados",
+            "Criptomonedas",
+            "ETF apalancados",
+            "ETF inversos",
+            "Productos estructurados complejos",
+        ],
+        "max_equity_percentage": 0,
+        "min_fixed_income_percentage": 0,
+        "max_weight_per_asset": 0,
+        "short_positions_allowed": False,
+        "leverage_allowed": False,
+        "minimum_history_years": 3,
+        "allowed_simulations": [],
+        "academic_warning": "",
+    }
+
+    if matrix_category == "Protección alta":
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija corto plazo",
+                "ETF renta fija agregada",
+                "Cartera modelo conservadora",
+            ],
+            "max_equity_percentage": 20,
+            "min_fixed_income_percentage": 80,
+            "max_weight_per_asset": 15,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera de mínima varianza",
+            ],
+            "academic_warning": (
+                "El análisis debe priorizar instrumentos simples, diversificados "
+                "y de menor volatilidad histórica."
+            ),
+        })
+
+    elif matrix_category in ["Protección moderada", "Crecimiento limitado"]:
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija corto plazo",
+                "ETF renta fija agregada",
+                "ETF renta variable diversificada",
+                "Cartera modelo conservadora",
+                "Cartera modelo moderada",
+            ],
+            "max_equity_percentage": 35,
+            "min_fixed_income_percentage": 65,
+            "max_weight_per_asset": 20,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera de mínima varianza",
+                "Comparación riesgo-rentabilidad",
+            ],
+            "academic_warning": (
+                "El usuario puede analizar una exposición limitada a renta variable, "
+                "siempre dentro de una estructura diversificada."
+            ),
+        })
+
+    elif matrix_category in ["Crecimiento prudente", "Crecimiento balanceado"]:
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija",
+                "ETF renta variable diversificada",
+                "Acciones individuales de baja o media volatilidad",
+                "Cartera modelo moderada",
+            ],
+            "max_equity_percentage": 60,
+            "min_fixed_income_percentage": 40,
+            "max_weight_per_asset": 20,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera de mínima varianza",
+                "Cartera máximo Sharpe restringida",
+                "Frontera eficiente académica",
+            ],
+            "academic_warning": (
+                "El usuario puede analizar una cartera balanceada entre renta fija "
+                "y renta variable, manteniendo control de concentración."
+            ),
+        })
+
+    elif matrix_category in ["Riesgo condicionado", "Crecimiento dinámico controlado"]:
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija",
+                "ETF renta variable diversificada",
+                "Acciones individuales de media volatilidad",
+                "Acciones individuales de alta volatilidad con límite reducido",
+            ],
+            "max_equity_percentage": 75,
+            "min_fixed_income_percentage": 25,
+            "max_weight_per_asset": 25,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera de mínima varianza",
+                "Cartera máximo Sharpe restringida",
+                "Monte Carlo académico",
+                "Frontera eficiente académica",
+            ],
+            "academic_warning": (
+                "El usuario puede analizar mayor exposición a renta variable, "
+                "pero con límites de concentración."
+            ),
+        })
+
+    elif matrix_category == "Riesgo no habilitado":
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija",
+                "ETF renta variable diversificada con límite bajo",
+                "Cartera modelo moderada",
+            ],
+            "max_equity_percentage": 40,
+            "min_fixed_income_percentage": 60,
+            "max_weight_per_asset": 15,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera de mínima varianza",
+                "Simulación educativa comparativa",
+            ],
+            "academic_warning": (
+                "Aunque el usuario manifiesta alta tolerancia al riesgo, su bajo "
+                "conocimiento financiero limita el acceso académico a activos complejos "
+                "o muy volátiles."
+            ),
+        })
+
+    elif matrix_category == "Riesgo alto restringido":
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija",
+                "ETF renta variable diversificada",
+                "Acciones individuales de media volatilidad",
+                "Acciones individuales de alta volatilidad con límite reducido",
+            ],
+            "max_equity_percentage": 80,
+            "min_fixed_income_percentage": 20,
+            "max_weight_per_asset": 25,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera máximo Sharpe restringida",
+                "Monte Carlo académico",
+                "Frontera eficiente académica",
+            ],
+            "academic_warning": (
+                "El usuario puede analizar activos de mayor riesgo, pero el sistema "
+                "mantiene restricciones por su nivel de conocimiento intermedio."
+            ),
+        })
+
+    elif matrix_category == "Riesgo alto permitido":
+        restrictions.update({
+            "allowed_asset_classes": [
+                "ETF renta fija",
+                "ETF renta variable diversificada",
+                "Acciones individuales",
+                "Acciones individuales de alta volatilidad",
+            ],
+            "max_equity_percentage": 100,
+            "min_fixed_income_percentage": 0,
+            "max_weight_per_asset": 30,
+            "allowed_simulations": [
+                "Cartera equiponderada",
+                "Cartera de mínima varianza",
+                "Cartera máximo Sharpe restringida",
+                "Monte Carlo académico",
+                "Frontera eficiente académica",
+            ],
+            "academic_warning": (
+                "El usuario presenta mayor tolerancia al riesgo y mayor conocimiento "
+                "financiero. Aun así, el modelo no permite apalancamiento ni posiciones cortas."
+            ),
+        })
+
+    return restrictions
+
+
+def generar_mensaje_perfil_academico(
+    risk_profile: str,
+    knowledge_level: str,
+    matrix_category: str,
+    restrictions: Dict[str, Any],
+) -> str:
+    return (
+        f"De acuerdo con las respuestas registradas, el usuario presenta un perfil de riesgo "
+        f"{risk_profile.lower()} y un nivel de conocimiento financiero {knowledge_level.lower()}. "
+        f"Al cruzar ambas variables, el modelo lo clasifica dentro de la categoría "
+        f"'{matrix_category}'. Para este perfil, la exposición máxima permitida a renta variable "
+        f"dentro del modelo académico es del {restrictions['max_equity_percentage']}%, "
+        f"mientras que el peso máximo por activo será del {restrictions['max_weight_per_asset']}%. "
+        f"Estas restricciones no constituyen una recomendación personalizada de inversión, "
+        f"sino una regla académica de prudencia para orientar la simulación."
+    )
+
+
+@app.post("/api/profile/evaluate")
+def evaluar_perfil_academico(request: ProfileRequest):
+    answers = normalizar_respuestas_perfil(request)
+
+    risk_score = calcular_puntaje_perfil(answers, RISK_QUESTIONS)
+    knowledge_score = calcular_puntaje_perfil(answers, KNOWLEDGE_QUESTIONS)
+
+    risk_profile = clasificar_perfil_riesgo(risk_score)
+    knowledge_level = clasificar_nivel_conocimiento(knowledge_score)
+
+    matrix_category = RISK_KNOWLEDGE_MATRIX[risk_profile][knowledge_level]
+
+    restrictions = obtener_restricciones_academicas(
+        risk_profile=risk_profile,
+        knowledge_level=knowledge_level,
+    )
+
+    message = generar_mensaje_perfil_academico(
+        risk_profile=risk_profile,
+        knowledge_level=knowledge_level,
+        matrix_category=matrix_category,
+        restrictions=restrictions,
+    )
+
+    resultado = {
+        "risk_score": risk_score,
+        "knowledge_score": knowledge_score,
+        "perfil_riesgo": risk_profile,
+        "nivel_conocimiento": knowledge_level,
+        "matriz_riesgo_conocimiento": matrix_category,
+        "restricciones": restrictions,
+        "mensaje_academico": message,
+    }
+
+    return {
+        "status": "ok",
+        "modulo": "profile-evaluate",
+        "resultado": resultado,
+        **resultado,
+    }
+# =============================================================
 
 def limpiar_tickers(activos: List[str]) -> List[str]:
     tickers = []
