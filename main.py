@@ -907,3 +907,425 @@ def obtener_matriz_riesgo_conocimiento():
         ),
     }
 #===========================================
+
+# ============================================================
+# MÓDULO CATÁLOGO MAESTRO DE ACTIVOS Y FILTRO POR PERFIL
+# ============================================================
+
+from pydantic import BaseModel
+from typing import Optional
+
+
+class AllowedAssetsRequest(BaseModel):
+    resultado: Optional[Dict[str, Any]] = None
+    restricciones: Optional[Dict[str, Any]] = None
+    perfil_riesgo: Optional[str] = None
+    nivel_conocimiento: Optional[str] = None
+    search: Optional[str] = None
+
+
+ASSET_CATALOG = [
+    {
+        "ticker": "SHY",
+        "name": "iShares 1-3 Year Treasury Bond ETF",
+        "asset_class": "ETF renta fija corto plazo",
+        "asset_type": "Renta fija ETF",
+        "risk_level": "Bajo",
+        "complexity": "Baja",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF que representa bonos del Tesoro estadounidense de corto plazo.",
+        "academic_note": "Puede servir para explicar renta fija de baja duración dentro de una simulación académica.",
+    },
+    {
+        "ticker": "VGSH",
+        "name": "Vanguard Short-Term Treasury ETF",
+        "asset_class": "ETF renta fija corto plazo",
+        "asset_type": "Renta fija ETF",
+        "risk_level": "Bajo",
+        "complexity": "Baja",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF de bonos del Tesoro de corto plazo.",
+        "academic_note": "Se utiliza como representación simple de renta fija de corto plazo.",
+    },
+    {
+        "ticker": "AGG",
+        "name": "iShares Core U.S. Aggregate Bond ETF",
+        "asset_class": "ETF renta fija agregada",
+        "asset_type": "Renta fija ETF",
+        "risk_level": "Bajo",
+        "complexity": "Baja",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF diversificado de bonos del mercado estadounidense.",
+        "academic_note": "Permite explicar una exposición diversificada a renta fija.",
+    },
+    {
+        "ticker": "BND",
+        "name": "Vanguard Total Bond Market ETF",
+        "asset_class": "ETF renta fija agregada",
+        "asset_type": "Renta fija ETF",
+        "risk_level": "Bajo",
+        "complexity": "Baja",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF amplio de renta fija estadounidense.",
+        "academic_note": "Representa una canasta diversificada de bonos para fines educativos.",
+    },
+    {
+        "ticker": "IEF",
+        "name": "iShares 7-10 Year Treasury Bond ETF",
+        "asset_class": "ETF renta fija",
+        "asset_type": "Renta fija ETF",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF de bonos del Tesoro estadounidense de mediano plazo.",
+        "academic_note": "Permite explicar sensibilidad a tasas de interés en renta fija.",
+    },
+    {
+        "ticker": "LQD",
+        "name": "iShares iBoxx Investment Grade Corporate Bond ETF",
+        "asset_class": "ETF renta fija",
+        "asset_type": "Renta fija ETF",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF de bonos corporativos con grado de inversión.",
+        "academic_note": "Útil para explicar que no toda renta fija tiene el mismo nivel de riesgo.",
+    },
+    {
+        "ticker": "VOO",
+        "name": "Vanguard S&P 500 ETF",
+        "asset_class": "ETF renta variable diversificada",
+        "asset_type": "Renta variable ETF",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF que replica el comportamiento de empresas del índice S&P 500.",
+        "academic_note": "Permite analizar renta variable diversificada sin escoger una sola acción.",
+    },
+    {
+        "ticker": "SPY",
+        "name": "SPDR S&P 500 ETF Trust",
+        "asset_class": "ETF renta variable diversificada",
+        "asset_type": "Renta variable ETF",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF ampliamente utilizado para representar el índice S&P 500.",
+        "academic_note": "Sirve como activo de referencia para comparar renta variable diversificada.",
+    },
+    {
+        "ticker": "VTI",
+        "name": "Vanguard Total Stock Market ETF",
+        "asset_class": "ETF renta variable diversificada",
+        "asset_type": "Renta variable ETF",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "ETF que representa una exposición amplia al mercado accionario estadounidense.",
+        "academic_note": "Permite explicar diversificación dentro de renta variable.",
+    },
+    {
+        "ticker": "VT",
+        "name": "Vanguard Total World Stock ETF",
+        "asset_class": "ETF renta variable diversificada",
+        "asset_type": "Renta variable ETF",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Global",
+        "data_source": "yfinance",
+        "description": "ETF con exposición global a mercados accionarios.",
+        "academic_note": "Útil para explicar diversificación geográfica.",
+    },
+    {
+        "ticker": "JNJ",
+        "name": "Johnson & Johnson",
+        "asset_class": "Acciones individuales de baja volatilidad",
+        "asset_type": "Acción individual",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "Acción individual de una compañía del sector salud.",
+        "academic_note": "Una acción individual tiene riesgo específico, aunque pertenezca a una empresa reconocida.",
+    },
+    {
+        "ticker": "PG",
+        "name": "Procter & Gamble",
+        "asset_class": "Acciones individuales de baja volatilidad",
+        "asset_type": "Acción individual",
+        "risk_level": "Medio",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "Acción individual de una compañía de consumo defensivo.",
+        "academic_note": "Permite explicar diferencia entre acción individual y ETF diversificado.",
+    },
+    {
+        "ticker": "AAPL",
+        "name": "Apple Inc.",
+        "asset_class": "Acciones individuales de media volatilidad",
+        "asset_type": "Acción individual",
+        "risk_level": "Medio-alto",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "Acción individual de una compañía tecnológica.",
+        "academic_note": "Debe analizarse con límites de concentración por tratarse de una acción individual.",
+    },
+    {
+        "ticker": "MSFT",
+        "name": "Microsoft Corporation",
+        "asset_class": "Acciones individuales de media volatilidad",
+        "asset_type": "Acción individual",
+        "risk_level": "Medio-alto",
+        "complexity": "Media",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "Acción individual de una compañía tecnológica.",
+        "academic_note": "Su análisis debe considerar volatilidad, concentración y riesgo específico.",
+    },
+    {
+        "ticker": "TSLA",
+        "name": "Tesla Inc.",
+        "asset_class": "Acciones individuales de alta volatilidad",
+        "asset_type": "Acción individual",
+        "risk_level": "Alto",
+        "complexity": "Alta",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "Acción individual con variaciones históricas fuertes.",
+        "academic_note": "Solo debe habilitarse para perfiles con mayor tolerancia y conocimiento, y con límite de concentración.",
+    },
+    {
+        "ticker": "NVDA",
+        "name": "NVIDIA Corporation",
+        "asset_class": "Acciones individuales de alta volatilidad",
+        "asset_type": "Acción individual",
+        "risk_level": "Alto",
+        "complexity": "Alta",
+        "currency": "USD",
+        "region": "Estados Unidos",
+        "data_source": "yfinance",
+        "description": "Acción tecnológica con alto crecimiento histórico y elevada variabilidad.",
+        "academic_note": "Debe analizarse con especial cuidado por su posible volatilidad y concentración sectorial.",
+    },
+]
+
+
+def extraer_restricciones_desde_request(request: AllowedAssetsRequest) -> Dict[str, Any]:
+    if request.restricciones:
+        return request.restricciones
+
+    if request.resultado and isinstance(request.resultado, dict):
+        restricciones = request.resultado.get("restricciones")
+        if restricciones:
+            return restricciones
+
+        perfil_riesgo = request.resultado.get("perfil_riesgo")
+        nivel_conocimiento = request.resultado.get("nivel_conocimiento")
+
+        if perfil_riesgo and nivel_conocimiento:
+            return obtener_restricciones_academicas(
+                risk_profile=perfil_riesgo,
+                knowledge_level=nivel_conocimiento,
+            )
+
+    if request.perfil_riesgo and request.nivel_conocimiento:
+        return obtener_restricciones_academicas(
+            risk_profile=request.perfil_riesgo,
+            knowledge_level=request.nivel_conocimiento,
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail="No fue posible obtener restricciones. Envía resultado, restricciones o perfil_riesgo/nivel_conocimiento.",
+    )
+
+
+def clase_activo_permitida(asset_class: str, allowed_classes: List[str]) -> bool:
+    asset_class_norm = asset_class.strip().lower()
+    allowed_norm = [item.strip().lower() for item in allowed_classes]
+
+    if asset_class_norm in allowed_norm:
+        return True
+
+    for allowed in allowed_norm:
+        if allowed == "etf renta fija" and asset_class_norm.startswith("etf renta fija"):
+            return True
+
+        if allowed == "acciones individuales" and asset_class_norm.startswith("acciones individuales"):
+            return True
+
+        if allowed == "acciones individuales de baja o media volatilidad":
+            if asset_class_norm in [
+                "acciones individuales de baja volatilidad",
+                "acciones individuales de media volatilidad",
+            ]:
+                return True
+
+        if allowed == "acciones individuales de alta volatilidad con límite reducido":
+            if asset_class_norm == "acciones individuales de alta volatilidad":
+                return True
+
+        if allowed == "etf renta variable diversificada":
+            if asset_class_norm == "etf renta variable diversificada":
+                return True
+
+    return False
+
+
+def aplicar_busqueda_activos(activos: List[Dict[str, Any]], search: Optional[str]) -> List[Dict[str, Any]]:
+    if not search:
+        return activos
+
+    term = search.strip().lower()
+
+    if not term:
+        return activos
+
+    filtrados = []
+
+    for activo in activos:
+        texto = " ".join([
+            str(activo.get("ticker", "")),
+            str(activo.get("name", "")),
+            str(activo.get("asset_class", "")),
+            str(activo.get("asset_type", "")),
+            str(activo.get("risk_level", "")),
+            str(activo.get("region", "")),
+        ]).lower()
+
+        if term in texto:
+            filtrados.append(activo)
+
+    return filtrados
+
+
+def enriquecer_activo_con_restricciones(
+    activo: Dict[str, Any],
+    restricciones: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    max_weight = restricciones.get("max_weight_per_asset", 0)
+
+    peso_maximo_aplicable = max_weight
+
+    if activo["asset_class"] == "Acciones individuales de alta volatilidad":
+        peso_maximo_aplicable = min(max_weight, 10)
+
+    activo_enriquecido = {
+        **activo,
+        "max_weight_allowed": peso_maximo_aplicable,
+        "selection_allowed": True,
+        "restriction_note": (
+            f"Peso máximo sugerido para este activo dentro del modelo: {peso_maximo_aplicable}%."
+        ),
+    }
+
+    if activo["asset_class"] == "Acciones individuales de alta volatilidad":
+        activo_enriquecido["restriction_note"] += (
+            " Al ser un activo de alta volatilidad, el sistema aplica un límite reducido."
+        )
+
+    return activo_enriquecido
+
+
+@app.post("/api/assets/allowed")
+def obtener_activos_permitidos(request: AllowedAssetsRequest):
+    restricciones = extraer_restricciones_desde_request(request)
+
+    allowed_classes = restricciones.get("allowed_asset_classes", [])
+
+    activos_permitidos = []
+    activos_bloqueados = []
+
+    for activo in ASSET_CATALOG:
+        permitido = clase_activo_permitida(
+            asset_class=activo["asset_class"],
+            allowed_classes=allowed_classes,
+        )
+
+        if permitido:
+            activos_permitidos.append(
+                enriquecer_activo_con_restricciones(activo, restricciones)
+            )
+        else:
+            activos_bloqueados.append({
+                **activo,
+                "selection_allowed": False,
+                "block_reason": (
+                    "Este activo no está habilitado para la categoría actual de la matriz riesgo-conocimiento."
+                ),
+            })
+
+    activos_permitidos = aplicar_busqueda_activos(
+        activos=activos_permitidos,
+        search=request.search,
+    )
+
+    perfil_riesgo = None
+    nivel_conocimiento = None
+    matriz_categoria = restricciones.get("categoria_matriz")
+
+    if request.resultado:
+        perfil_riesgo = request.resultado.get("perfil_riesgo")
+        nivel_conocimiento = request.resultado.get("nivel_conocimiento")
+        matriz_categoria = request.resultado.get("matriz_riesgo_conocimiento", matriz_categoria)
+
+    return {
+        "status": "ok",
+        "modulo": "assets-allowed",
+        "perfil_riesgo": perfil_riesgo,
+        "nivel_conocimiento": nivel_conocimiento,
+        "matriz_riesgo_conocimiento": matriz_categoria,
+        "restricciones": restricciones,
+        "activos_permitidos": activos_permitidos,
+        "activos_bloqueados": activos_bloqueados,
+        "total_permitidos": len(activos_permitidos),
+        "total_bloqueados": len(activos_bloqueados),
+        "resumen": (
+            "Los activos mostrados fueron filtrados por la matriz riesgo-conocimiento "
+            "y por las restricciones académicas del usuario. Este catálogo no representa "
+            "una recomendación personalizada de inversión."
+        ),
+    }
+
+
+@app.get("/api/assets/catalog")
+def obtener_catalogo_activos():
+    return {
+        "status": "ok",
+        "modulo": "asset-catalog",
+        "total_activos": len(ASSET_CATALOG),
+        "catalogo": ASSET_CATALOG,
+        "advertencia": (
+            "Este catálogo tiene finalidad académica. Los activos incluidos son referencias "
+            "para simulación y no constituyen recomendación de inversión."
+        ),
+    }
+
+#==================================================
