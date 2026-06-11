@@ -365,6 +365,15 @@ def evaluar_perfil_academico(request: ProfileRequest):
         knowledge_level=knowledge_level,
     )
 
+    restricciones_resumen = [
+    f"Exposición máxima a renta variable: {restrictions['max_equity_percentage']}%",
+    f"Exposición mínima sugerida a renta fija: {restrictions['min_fixed_income_percentage']}%",
+    f"Peso máximo por activo: {restrictions['max_weight_per_asset']}%",
+    f"Historial mínimo requerido: {restrictions['minimum_history_years']} años",
+    "Posiciones cortas: No permitidas" if not restrictions["short_positions_allowed"] else "Posiciones cortas: Permitidas",
+    "Apalancamiento: No permitido" if not restrictions["leverage_allowed"] else "Apalancamiento: Permitido",
+    ]
+
     message = generar_mensaje_perfil_academico(
         risk_profile=risk_profile,
         knowledge_level=knowledge_level,
@@ -380,6 +389,7 @@ def evaluar_perfil_academico(request: ProfileRequest):
         "matriz_riesgo_conocimiento": matrix_category,
         "restricciones": restrictions,
         "mensaje_academico": message,
+        "restricciones_resumen": restricciones_resumen,
     }
 
     return {
