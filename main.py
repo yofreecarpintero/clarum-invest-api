@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 from io import StringIO
 
@@ -14,7 +14,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.6",
+    version="0.2.7",
 )
 
 app.add_middleware(
@@ -759,7 +759,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.6",
+        "version": "0.2.7",
     }
 
 
@@ -768,7 +768,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.6",
+        "version": "0.2.7",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1581,3 +1581,370 @@ def validar_portafolio_academico(request: PortfolioValidationRequest):
     }
 
 #==========================================================================
+
+# ============================================================
+# MÓDULO SIMULADOR ACADÉMICO DE PORTAFOLIO
+# ============================================================
+
+class PortfolioSimulationRequest(BaseModel):
+    resultado: Optional[Dict[str, Any]] = None
+    selected_assets: List[Dict[str, Any]]
+    weights: Dict[str, float]
+    period: Optional[str] = "2y"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    timeframe: Optional[str] = "diario"
+    risk_free_rate: Optional[float] = 0.0
+
+
+def obtener_factor_anualizacion(timeframe: str) -> int:
+    tf = str(timeframe).strip().lower()
+
+    factores = {
+        "diario": 252,
+        "semanal": 52,
+        "quincenal": 24,
+        "mensual": 12,
+        "trimestral": 4,
+        "semestral": 2,
+        "anual": 1,
+    }
+
+    return factores.get(tf, 252)
+
+
+def obtener_regla_resample(timeframe: str) -> Optional[str]:
+    tf = str(timeframe).strip().lower()
+
+    reglas = {
+        "diario": None,
+        "semanal": "W-FRI",
+        "quincenal": "15D",
+        "mensual": "M",
+        "trimestral": "Q",
+        "semestral": "2Q",
+        "anual": "Y",
+    }
+
+    return reglas.get(tf, None)
+
+
+def descargar_precios_yfinance_simulacion(
+    tickers: List[str],
+    period: str = "2y",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+
+    kwargs = {
+        "tickers": tickers,
+        "interval": "1d",
+        "auto_adjust": True,
+        "progress": False,
+        "threads": False,
+    }
+
+    if start_date and end_date:
+        fecha_inicio = pd.to_datetime(start_date)
+        fecha_fin = pd.to_datetime(end_date) + timedelta(days=1)
+
+        kwargs["start"] = fecha_inicio.strftime("%Y-%m-%d")
+        kwargs["end"] = fecha_fin.strftime("%Y-%m-%d")
+    else:
+        kwargs["period"] = period or "2y"
+
+    data = yf.download(**kwargs)
+
+    if data.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="yfinance no devolvió datos históricos para los activos seleccionados.",
+        )
+
+    if isinstance(data.columns, pd.MultiIndex):
+        if "Close" in data.columns.get_level_values(0):
+            precios = data["Close"]
+        elif "Adj Close" in data.columns.get_level_values(0):
+            precios = data["Adj Close"]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="No se encontró columna de cierre en los datos descargados.",
+            )
+    else:
+        if "Close" in data.columns:
+            precios = data[["Close"]]
+            precios.columns = tickers
+        elif "Adj Close" in data.columns:
+            precios = data[["Adj Close"]]
+            precios.columns = tickers
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="No se encontró columna Close o Adj Close en los datos descargados.",
+            )
+
+    precios = precios.copy()
+    precios = precios.apply(pd.to_numeric, errors="coerce")
+    precios = precios.dropna(how="all")
+    precios = precios.ffill().dropna()
+
+    columnas_disponibles = [col for col in precios.columns if str(col).upper() in tickers]
+    precios = precios[columnas_disponibles]
+
+    if precios.empty or len(precios) < 30:
+        raise HTTPException(
+            status_code=400,
+            detail="No hay suficientes datos históricos comunes para ejecutar la simulación.",
+        )
+
+    precios.columns = [str(col).upper() for col in precios.columns]
+
+    return precios
+
+
+def aplicar_marco_temporal(precios: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    regla = obtener_regla_resample(timeframe)
+
+    if regla is None:
+        return precios
+
+    precios_resampleados = precios.resample(regla).last().dropna()
+
+    if precios_resampleados.empty or len(precios_resampleados) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="No hay suficientes observaciones para el marco temporal seleccionado.",
+        )
+
+    return precios_resampleados
+
+
+def generar_explicacion_simulacion(
+    rentabilidad_anual: float,
+    volatilidad_anual: float,
+    sharpe_ratio: float,
+    max_drawdown: float,
+    var_95: float,
+    cvar_95: float,
+    timeframe: str,
+    activos: List[str],
+) -> str:
+
+    rentabilidad_pct = rentabilidad_anual * 100
+    volatilidad_pct = volatilidad_anual * 100
+    drawdown_pct = max_drawdown * 100
+    var_pct = var_95 * 100
+    cvar_pct = cvar_95 * 100
+
+    if volatilidad_anual < 0.10:
+        nivel_riesgo = "bajo"
+    elif volatilidad_anual < 0.20:
+        nivel_riesgo = "medio"
+    else:
+        nivel_riesgo = "alto"
+
+    return (
+        f"La simulación histórica del portafolio compuesto por {', '.join(activos)} "
+        f"muestra una rentabilidad anualizada aproximada de {rentabilidad_pct:.2f}% "
+        f"y una volatilidad anualizada de {volatilidad_pct:.2f}%, usando un marco temporal "
+        f"{timeframe}. En términos sencillos, la rentabilidad indica cuánto habría crecido "
+        f"el portafolio en promedio anual según los datos históricos, mientras que la volatilidad "
+        f"muestra qué tan fuertes fueron sus variaciones. Con base en la volatilidad observada, "
+        f"el riesgo histórico se clasifica como {nivel_riesgo}. El máximo drawdown fue de "
+        f"{drawdown_pct:.2f}%, lo que representa la mayor caída histórica desde un máximo hasta "
+        f"un mínimo dentro del periodo analizado. El VaR histórico al 95% fue de {var_pct:.2f}% "
+        f"y el CVaR fue de {cvar_pct:.2f}%, indicadores que permiten observar pérdidas históricas "
+        f"en escenarios desfavorables. El ratio de Sharpe fue de {sharpe_ratio:.2f}, lo que permite "
+        f"relacionar la rentabilidad obtenida con el riesgo asumido. Estos resultados no predicen "
+        f"el futuro y tienen finalidad exclusivamente académica."
+    )
+
+
+@app.post("/api/portfolio/simulate")
+def simular_portafolio_academico(request: PortfolioSimulationRequest):
+
+    validacion = validar_portafolio_academico(
+        PortfolioValidationRequest(
+            resultado=request.resultado,
+            selected_assets=request.selected_assets,
+            weights=request.weights,
+        )
+    )
+
+    if not validacion.get("is_valid"):
+        return {
+            "status": "error",
+            "modulo": "portfolio-simulate",
+            "validation": validacion,
+            "mensaje": (
+                "El portafolio no puede simularse porque no cumple las restricciones "
+                "académicas del perfil."
+            ),
+        }
+
+    tickers = [
+        str(asset.get("ticker", "")).upper().strip()
+        for asset in request.selected_assets
+        if str(asset.get("ticker", "")).strip()
+    ]
+
+    if not tickers:
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontraron tickers válidos para la simulación.",
+        )
+
+    pesos_pct = {
+        str(ticker).upper(): float(peso)
+        for ticker, peso in request.weights.items()
+    }
+
+    pesos = np.array([
+        pesos_pct.get(ticker, 0) / 100
+        for ticker in tickers
+    ])
+
+    if abs(pesos.sum() - 1.0) > 0.001:
+        raise HTTPException(
+            status_code=400,
+            detail="Los pesos deben sumar 100% para ejecutar la simulación.",
+        )
+
+    precios = descargar_precios_yfinance_simulacion(
+        tickers=tickers,
+        period=request.period or "2y",
+        start_date=request.start_date,
+        end_date=request.end_date,
+    )
+
+    precios = precios[tickers].dropna()
+    precios = aplicar_marco_temporal(precios, request.timeframe or "diario")
+
+    retornos = precios.pct_change().dropna()
+
+    if retornos.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No fue posible calcular retornos para la simulación.",
+        )
+
+    factor = obtener_factor_anualizacion(request.timeframe or "diario")
+    retornos_portafolio = retornos.dot(pesos)
+
+    rentabilidad_anual = float(retornos_portafolio.mean() * factor)
+    volatilidad_anual = float(retornos_portafolio.std() * np.sqrt(factor))
+
+    risk_free_rate = float(request.risk_free_rate or 0.0)
+    sharpe_ratio = (
+        (rentabilidad_anual - risk_free_rate) / volatilidad_anual
+        if volatilidad_anual > 0
+        else 0.0
+    )
+
+    acumulado = (1 + retornos_portafolio).cumprod()
+    maximo_acumulado = acumulado.cummax()
+    drawdown = acumulado / maximo_acumulado - 1
+    max_drawdown = float(drawdown.min())
+
+    percentil_5 = float(np.percentile(retornos_portafolio, 5))
+    var_95 = max(0.0, -percentil_5)
+
+    retornos_cola = retornos_portafolio[retornos_portafolio <= percentil_5]
+    cvar_95 = max(0.0, -float(retornos_cola.mean())) if len(retornos_cola) > 0 else 0.0
+
+    correlacion = retornos.corr().round(4).to_dict()
+
+    rentabilidades_individuales = (retornos.mean() * factor).round(6).to_dict()
+    volatilidades_individuales = (retornos.std() * np.sqrt(factor)).round(6).to_dict()
+
+    performance_series = [
+        {
+            "date": str(index.date()),
+            "portfolio_value": round(float(value), 6),
+        }
+        for index, value in acumulado.items()
+    ]
+
+    drawdown_series = [
+        {
+            "date": str(index.date()),
+            "drawdown": round(float(value), 6),
+        }
+        for index, value in drawdown.items()
+    ]
+
+    pesos_utilizados = {
+        ticker: round(float(pesos_pct.get(ticker, 0)), 4)
+        for ticker in tickers
+    }
+
+    activos_detalle = []
+
+    for asset in request.selected_assets:
+        ticker = str(asset.get("ticker", "")).upper().strip()
+
+        catalog_asset = validar_activo_con_catalogo(ticker)
+
+        activos_detalle.append({
+            "ticker": ticker,
+            "name": asset.get("name") or (catalog_asset or {}).get("name"),
+            "asset_class": asset.get("asset_class") or (catalog_asset or {}).get("asset_class"),
+            "asset_type": asset.get("asset_type") or (catalog_asset or {}).get("asset_type"),
+            "risk_level": asset.get("risk_level") or (catalog_asset or {}).get("risk_level"),
+            "complexity": asset.get("complexity") or (catalog_asset or {}).get("complexity"),
+            "weight": pesos_utilizados.get(ticker, 0),
+            "rentabilidad_anualizada": rentabilidades_individuales.get(ticker),
+            "volatilidad_anualizada": volatilidades_individuales.get(ticker),
+        })
+
+    explicacion = generar_explicacion_simulacion(
+        rentabilidad_anual=rentabilidad_anual,
+        volatilidad_anual=volatilidad_anual,
+        sharpe_ratio=sharpe_ratio,
+        max_drawdown=max_drawdown,
+        var_95=var_95,
+        cvar_95=cvar_95,
+        timeframe=request.timeframe or "diario",
+        activos=tickers,
+    )
+
+    return {
+        "status": "ok",
+        "modulo": "portfolio-simulate",
+        "validation": validacion,
+        "activos": activos_detalle,
+        "pesos_utilizados": pesos_utilizados,
+        "parametros": {
+            "period": request.period,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "timeframe": request.timeframe,
+            "annualization_factor": factor,
+            "risk_free_rate": risk_free_rate,
+        },
+        "fecha_inicio": str(precios.index.min().date()),
+        "fecha_fin": str(precios.index.max().date()),
+        "numero_observaciones": int(len(precios)),
+        "metricas_portafolio": {
+            "rentabilidad_anualizada": round(rentabilidad_anual, 6),
+            "volatilidad_anualizada": round(volatilidad_anual, 6),
+            "sharpe_ratio": round(float(sharpe_ratio), 6),
+            "max_drawdown": round(max_drawdown, 6),
+            "var_95_historico": round(var_95, 6),
+            "cvar_95_historico": round(cvar_95, 6),
+        },
+        "metricas_individuales": {
+            "rentabilidad_anualizada": rentabilidades_individuales,
+            "volatilidad_anualizada": volatilidades_individuales,
+        },
+        "matriz_correlacion": correlacion,
+        "performance_series": performance_series,
+        "drawdown_series": drawdown_series,
+        "explicacion_lenguaje_natural": explicacion,
+        "advertencia": (
+            "Los cálculos se basan en datos históricos y tienen finalidad académica. "
+            "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
+        ),
+    }
+    =============================================================
