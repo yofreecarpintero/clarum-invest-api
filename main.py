@@ -873,3 +873,37 @@ def calcular_riesgo(payload: Dict[str, Any]):
             "una predicción exacta del comportamiento futuro del mercado."
         ),
     }
+
+#==========================================
+# MATRIZ RIESGO CONOCIMIENTO
+#==========================================
+
+@app.get("/api/profile/risk-knowledge-matrix")
+def obtener_matriz_riesgo_conocimiento():
+    return {
+        "status": "ok",
+        "modulo": "risk-knowledge-matrix",
+        "risk_profiles": [
+            "Conservador",
+            "Moderado",
+            "Dinámico",
+            "Agresivo",
+        ],
+        "knowledge_levels": [
+            "Básico",
+            "Intermedio",
+            "Avanzado",
+        ],
+        "matrix": RISK_KNOWLEDGE_MATRIX,
+        "descripcion": (
+            "La matriz riesgo-conocimiento cruza el perfil de riesgo del usuario "
+            "con su nivel de conocimiento financiero. Su finalidad es definir "
+            "restricciones académicas prudenciales para la selección de activos "
+            "y la simulación de carteras."
+        ),
+        "advertencia": (
+            "Esta matriz tiene finalidad académica y no constituye asesoría "
+            "financiera personalizada."
+        ),
+    }
+#===========================================
