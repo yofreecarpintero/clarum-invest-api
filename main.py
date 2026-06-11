@@ -5,7 +5,9 @@ from io import StringIO
 import numpy as np
 import pandas as pd
 import requests
+import math
 import yfinance as yf
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.7",
+    version="0.2.8",
 )
 
 app.add_middleware(
@@ -759,7 +761,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.7",
+        "version": "0.2.8",
     }
 
 
@@ -768,7 +770,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.7",
+        "version": "0.2.8",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1613,17 +1615,17 @@ def obtener_factor_anualizacion(timeframe: str) -> int:
     return factores.get(tf, 252)
 
 
-def obtener_regla_resample(timeframe: str) -> Optional[str]:
+def obtener_regla_resample(timeframe: str):
     tf = str(timeframe).strip().lower()
 
     reglas = {
         "diario": None,
         "semanal": "W-FRI",
         "quincenal": "15D",
-        "mensual": "M",
-        "trimestral": "Q",
-        "semestral": "2Q",
-        "anual": "Y",
+        "mensual": "ME",
+        "trimestral": "QE",
+        "semestral": "6ME",
+        "anual": "YE",
     }
 
     return reglas.get(tf, None)
@@ -1705,16 +1707,36 @@ def descargar_precios_yfinance_simulacion(
 
 def aplicar_marco_temporal(precios: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     regla = obtener_regla_resample(timeframe)
+    tf = str(timeframe).strip().lower()
 
     if regla is None:
         return precios
 
-    precios_resampleados = precios.resample(regla).last().dropna()
-
-    if precios_resampleados.empty or len(precios_resampleados) < 3:
+    try:
+        precios_resampleados = precios.resample(regla).last().dropna()
+    except Exception as error:
         raise HTTPException(
             status_code=400,
-            detail="No hay suficientes observaciones para el marco temporal seleccionado.",
+            detail=(
+                f"No fue posible convertir los precios al marco temporal '{timeframe}'. "
+                f"Detalle técnico: {str(error)}"
+            ),
+        )
+
+    min_observaciones = {
+        "mensual": 6,
+        "trimestral": 4,
+        "semestral": 3,
+        "anual": 3,
+    }.get(tf, 3)
+
+    if precios_resampleados.empty or len(precios_resampleados) < min_observaciones:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No hay suficientes observaciones para el marco temporal '{timeframe}'. "
+                "Selecciona un periodo más amplio, por ejemplo 2 años, 5 años o máximo disponible."
+            ),
         )
 
     return precios_resampleados
@@ -1909,42 +1931,67 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         activos=tickers,
     )
 
-    return {
-        "status": "ok",
-        "modulo": "portfolio-simulate",
-        "validation": validacion,
-        "activos": activos_detalle,
-        "pesos_utilizados": pesos_utilizados,
-        "parametros": {
-            "period": request.period,
-            "start_date": request.start_date,
-            "end_date": request.end_date,
-            "timeframe": request.timeframe,
-            "annualization_factor": factor,
-            "risk_free_rate": risk_free_rate,
-        },
-        "fecha_inicio": str(precios.index.min().date()),
-        "fecha_fin": str(precios.index.max().date()),
-        "numero_observaciones": int(len(precios)),
-        "metricas_portafolio": {
-            "rentabilidad_anualizada": round(rentabilidad_anual, 6),
-            "volatilidad_anualizada": round(volatilidad_anual, 6),
-            "sharpe_ratio": round(float(sharpe_ratio), 6),
-            "max_drawdown": round(max_drawdown, 6),
-            "var_95_historico": round(var_95, 6),
-            "cvar_95_historico": round(cvar_95, 6),
-        },
-        "metricas_individuales": {
-            "rentabilidad_anualizada": rentabilidades_individuales,
-            "volatilidad_anualizada": volatilidades_individuales,
-        },
-        "matriz_correlacion": correlacion,
-        "performance_series": performance_series,
-        "drawdown_series": drawdown_series,
-        "explicacion_lenguaje_natural": explicacion,
-        "advertencia": (
-            "Los cálculos se basan en datos históricos y tienen finalidad académica. "
-            "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
-        ),
-    }
+   respuesta = {
+    "status": "ok",
+    "modulo": "portfolio-simulate",
+    "validation": validacion,
+    "activos": activos_detalle,
+    "pesos_utilizados": pesos_utilizados,
+    "parametros": {
+        "period": request.period,
+        "start_date": request.start_date,
+        "end_date": request.end_date,
+        "timeframe": request.timeframe,
+        "annualization_factor": factor,
+        "risk_free_rate": risk_free_rate,
+    },
+    "fecha_inicio": str(precios.index.min().date()),
+    "fecha_fin": str(precios.index.max().date()),
+    "numero_observaciones": int(len(precios)),
+    "metricas_portafolio": {
+        "rentabilidad_anualizada": round(rentabilidad_anual, 6),
+        "volatilidad_anualizada": round(volatilidad_anual, 6),
+        "sharpe_ratio": round(float(sharpe_ratio), 6),
+        "max_drawdown": round(max_drawdown, 6),
+        "var_95_historico": round(var_95, 6),
+        "cvar_95_historico": round(cvar_95, 6),
+    },
+    "metricas_individuales": {
+        "rentabilidad_anualizada": rentabilidades_individuales,
+        "volatilidad_anualizada": volatilidades_individuales,
+    },
+    "matriz_correlacion": correlacion,
+    "performance_series": performance_series,
+    "drawdown_series": drawdown_series,
+    "explicacion_lenguaje_natural": explicacion,
+    "advertencia": (
+        "Los cálculos se basan en datos históricos y tienen finalidad académica. "
+        "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
+    ),
+}
+
+return limpiar_valores_json(respuesta)
+
     #=============================================================
+
+def limpiar_valores_json(obj):
+    if isinstance(obj, dict):
+        return {
+            key: limpiar_valores_json(value)
+            for key, value in obj.items()
+        }
+
+    if isinstance(obj, list):
+        return [
+            limpiar_valores_json(item)
+            for item in obj
+        ]
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+
+    return obj
+
+#=============================================================
