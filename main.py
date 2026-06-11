@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.8",
+    version="0.2.9",
 )
 
 app.add_middleware(
@@ -761,7 +761,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.8",
+        "version": "0.2.9",
     }
 
 
@@ -770,7 +770,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.8",
+        "version": "0.2.9",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1995,3 +1995,734 @@ def limpiar_valores_json(obj):
     return obj
 
 #=============================================================
+
+# ============================================================
+# MÓDULO COMPARADOR ACADÉMICO DE CARTERAS
+# ============================================================
+
+class PortfolioCompareRequest(BaseModel):
+    resultado: Optional[Dict[str, Any]] = None
+    selected_assets: List[Dict[str, Any]]
+    user_weights: Dict[str, float]
+    period: Optional[str] = "2y"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    timeframe: Optional[str] = "mensual"
+    risk_free_rate: Optional[float] = 0.0
+    monte_carlo_portfolios: Optional[int] = 3000
+
+
+def obtener_tickers_activos(selected_assets: List[Dict[str, Any]]) -> List[str]:
+    return [
+        str(asset.get("ticker", "")).upper().strip()
+        for asset in selected_assets
+        if str(asset.get("ticker", "")).strip()
+    ]
+
+
+def obtener_composicion_por_clase(
+    weights_pct: Dict[str, float],
+    selected_assets: List[Dict[str, Any]],
+) -> Dict[str, float]:
+
+    renta_fija = 0.0
+    renta_variable = 0.0
+    otros = 0.0
+
+    for asset in selected_assets:
+        ticker = str(asset.get("ticker", "")).upper().strip()
+        peso = float(weights_pct.get(ticker, 0.0))
+        clase_general = obtener_clase_general_activo(asset.get("asset_class", ""))
+
+        if clase_general == "renta_fija":
+            renta_fija += peso
+        elif clase_general == "renta_variable":
+            renta_variable += peso
+        else:
+            otros += peso
+
+    return {
+        "renta_fija": round(renta_fija, 4),
+        "renta_variable": round(renta_variable, 4),
+        "otros": round(otros, 4),
+        "total": round(renta_fija + renta_variable + otros, 4),
+    }
+
+
+def obtener_restricciones_comparador(resultado: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    restricciones = extraer_restricciones_desde_request(
+        AllowedAssetsRequest(resultado=resultado or {})
+    )
+
+    return {
+        "max_equity_percentage": float(restricciones.get("max_equity_percentage", 100)),
+        "min_fixed_income_percentage": float(restricciones.get("min_fixed_income_percentage", 0)),
+        "max_weight_per_asset": float(restricciones.get("max_weight_per_asset", 100)),
+        "short_positions_allowed": bool(restricciones.get("short_positions_allowed", False)),
+        "leverage_allowed": bool(restricciones.get("leverage_allowed", False)),
+    }
+
+
+def validar_pesos_con_restricciones(
+    weights_pct: Dict[str, float],
+    selected_assets: List[Dict[str, Any]],
+    restricciones: Dict[str, Any],
+) -> bool:
+
+    total = sum(float(v) for v in weights_pct.values())
+
+    if abs(total - 100.0) > 0.01:
+        return False
+
+    max_weight = float(restricciones.get("max_weight_per_asset", 100))
+    max_equity = float(restricciones.get("max_equity_percentage", 100))
+    min_fixed = float(restricciones.get("min_fixed_income_percentage", 0))
+
+    for peso in weights_pct.values():
+        peso_float = float(peso)
+
+        if peso_float < -0.0001:
+            return False
+
+        if peso_float > max_weight + 0.0001:
+            return False
+
+    composicion = obtener_composicion_por_clase(weights_pct, selected_assets)
+
+    if composicion["renta_variable"] > max_equity + 0.01:
+        return False
+
+    if composicion["renta_fija"] + 0.01 < min_fixed:
+        return False
+
+    return True
+
+
+def pesos_dict_a_vector(
+    weights_pct: Dict[str, float],
+    tickers: List[str],
+) -> np.ndarray:
+
+    return np.array([
+        float(weights_pct.get(ticker, 0.0)) / 100.0
+        for ticker in tickers
+    ])
+
+
+def pesos_vector_a_dict(
+    weights_vector: np.ndarray,
+    tickers: List[str],
+) -> Dict[str, float]:
+
+    return {
+        ticker: round(float(weight) * 100.0, 4)
+        for ticker, weight in zip(tickers, weights_vector)
+    }
+
+
+def construir_cartera_equiponderada_restringida(
+    selected_assets: List[Dict[str, Any]],
+    restricciones: Dict[str, Any],
+) -> Dict[str, float]:
+
+    tickers = obtener_tickers_activos(selected_assets)
+    n = len(tickers)
+
+    if n == 0:
+        return {}
+
+    peso_base = 100.0 / n
+    max_weight = float(restricciones.get("max_weight_per_asset", 100))
+
+    if peso_base <= max_weight:
+        weights = {ticker: round(peso_base, 4) for ticker in tickers}
+
+        if validar_pesos_con_restricciones(weights, selected_assets, restricciones):
+            return weights
+
+    return {}
+
+
+def distribuir_peso_en_grupo(
+    tickers_grupo: List[str],
+    peso_total: float,
+    max_weight: float,
+) -> Dict[str, float]:
+
+    if not tickers_grupo or peso_total <= 0:
+        return {}
+
+    capacidad_total = len(tickers_grupo) * max_weight
+
+    if peso_total > capacidad_total + 0.0001:
+        return {}
+
+    peso_inicial = peso_total / len(tickers_grupo)
+
+    if peso_inicial <= max_weight:
+        return {
+            ticker: round(peso_inicial, 4)
+            for ticker in tickers_grupo
+        }
+
+    pesos = {ticker: 0.0 for ticker in tickers_grupo}
+    restante = peso_total
+    tickers_disponibles = tickers_grupo.copy()
+
+    while restante > 0.0001 and tickers_disponibles:
+        peso_por_ticker = restante / len(tickers_disponibles)
+        nuevos_disponibles = []
+
+        for ticker in tickers_disponibles:
+            asignacion = min(peso_por_ticker, max_weight - pesos[ticker])
+            pesos[ticker] += asignacion
+            restante -= asignacion
+
+            if pesos[ticker] < max_weight - 0.0001:
+                nuevos_disponibles.append(ticker)
+
+        if len(nuevos_disponibles) == len(tickers_disponibles):
+            break
+
+        tickers_disponibles = nuevos_disponibles
+
+    return {
+        ticker: round(peso, 4)
+        for ticker, peso in pesos.items()
+        if peso > 0.0001
+    }
+
+
+def construir_cartera_modelo_perfil(
+    selected_assets: List[Dict[str, Any]],
+    restricciones: Dict[str, Any],
+) -> Dict[str, float]:
+
+    max_equity = float(restricciones.get("max_equity_percentage", 100))
+    min_fixed = float(restricciones.get("min_fixed_income_percentage", 0))
+    max_weight = float(restricciones.get("max_weight_per_asset", 100))
+
+    tickers_renta_fija = []
+    tickers_renta_variable = []
+    tickers_otros = []
+
+    for asset in selected_assets:
+        ticker = str(asset.get("ticker", "")).upper().strip()
+        clase_general = obtener_clase_general_activo(asset.get("asset_class", ""))
+
+        if clase_general == "renta_fija":
+            tickers_renta_fija.append(ticker)
+        elif clase_general == "renta_variable":
+            tickers_renta_variable.append(ticker)
+        else:
+            tickers_otros.append(ticker)
+
+    peso_renta_fija = min_fixed
+    peso_renta_variable = min(100.0 - peso_renta_fija, max_equity)
+
+    if peso_renta_fija + peso_renta_variable < 100.0:
+        faltante = 100.0 - peso_renta_fija - peso_renta_variable
+
+        if tickers_renta_fija:
+            peso_renta_fija += faltante
+        elif tickers_renta_variable:
+            peso_renta_variable += faltante
+
+    pesos = {}
+
+    pesos.update(
+        distribuir_peso_en_grupo(
+            tickers_grupo=tickers_renta_fija,
+            peso_total=peso_renta_fija,
+            max_weight=max_weight,
+        )
+    )
+
+    pesos.update(
+        distribuir_peso_en_grupo(
+            tickers_grupo=tickers_renta_variable,
+            peso_total=peso_renta_variable,
+            max_weight=max_weight,
+        )
+    )
+
+    total = sum(pesos.values())
+
+    if abs(total - 100.0) > 0.01:
+        return {}
+
+    if validar_pesos_con_restricciones(pesos, selected_assets, restricciones):
+        return pesos
+
+    return {}
+
+
+def generar_pesos_aleatorios_restringidos(
+    selected_assets: List[Dict[str, Any]],
+    restricciones: Dict[str, Any],
+    cantidad: int = 3000,
+    seed: int = 42,
+) -> List[Dict[str, float]]:
+
+    np.random.seed(seed)
+
+    tickers = obtener_tickers_activos(selected_assets)
+    n = len(tickers)
+
+    if n == 0:
+        return []
+
+    candidatos = []
+    intentos_maximos = cantidad * 30
+    intentos = 0
+
+    while len(candidatos) < cantidad and intentos < intentos_maximos:
+        intentos += 1
+
+        vector = np.random.dirichlet(np.ones(n))
+        pesos = pesos_vector_a_dict(vector, tickers)
+
+        if validar_pesos_con_restricciones(pesos, selected_assets, restricciones):
+            candidatos.append(pesos)
+
+    return candidatos
+
+
+def calcular_metricas_de_pesos(
+    retornos: pd.DataFrame,
+    weights_pct: Dict[str, float],
+    tickers: List[str],
+    factor: int,
+    risk_free_rate: float = 0.0,
+) -> Dict[str, float]:
+
+    vector = pesos_dict_a_vector(weights_pct, tickers)
+    retornos_portafolio = retornos.dot(vector)
+
+    rentabilidad_anual = float(retornos_portafolio.mean() * factor)
+    volatilidad_anual = float(retornos_portafolio.std() * np.sqrt(factor))
+
+    sharpe = (
+        (rentabilidad_anual - risk_free_rate) / volatilidad_anual
+        if volatilidad_anual > 0
+        else 0.0
+    )
+
+    acumulado = (1 + retornos_portafolio).cumprod()
+    drawdown = acumulado / acumulado.cummax() - 1
+    max_drawdown = float(drawdown.min())
+
+    percentil_5 = float(np.percentile(retornos_portafolio, 5))
+    var_95 = max(0.0, -percentil_5)
+
+    cola = retornos_portafolio[retornos_portafolio <= percentil_5]
+    cvar_95 = max(0.0, -float(cola.mean())) if len(cola) > 0 else 0.0
+
+    return {
+        "rentabilidad_anualizada": round(rentabilidad_anual, 6),
+        "volatilidad_anualizada": round(volatilidad_anual, 6),
+        "sharpe_ratio": round(float(sharpe), 6),
+        "max_drawdown": round(max_drawdown, 6),
+        "var_95_historico": round(var_95, 6),
+        "cvar_95_historico": round(cvar_95, 6),
+    }
+
+
+def construir_series_portafolio(
+    retornos: pd.DataFrame,
+    weights_pct: Dict[str, float],
+    tickers: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+
+    vector = pesos_dict_a_vector(weights_pct, tickers)
+    retornos_portafolio = retornos.dot(vector)
+
+    acumulado = (1 + retornos_portafolio).cumprod()
+    drawdown = acumulado / acumulado.cummax() - 1
+
+    performance_series = [
+        {
+            "date": str(index.date()),
+            "portfolio_value": round(float(value), 6),
+        }
+        for index, value in acumulado.items()
+    ]
+
+    drawdown_series = [
+        {
+            "date": str(index.date()),
+            "drawdown": round(float(value), 6),
+        }
+        for index, value in drawdown.items()
+    ]
+
+    return {
+        "performance_series": performance_series,
+        "drawdown_series": drawdown_series,
+    }
+
+
+def seleccionar_mejores_carteras_montecarlo(
+    candidatos: List[Dict[str, float]],
+    retornos: pd.DataFrame,
+    tickers: List[str],
+    factor: int,
+    risk_free_rate: float,
+) -> Dict[str, Dict[str, Any]]:
+
+    evaluadas = []
+
+    for pesos in candidatos:
+        metricas = calcular_metricas_de_pesos(
+            retornos=retornos,
+            weights_pct=pesos,
+            tickers=tickers,
+            factor=factor,
+            risk_free_rate=risk_free_rate,
+        )
+
+        evaluadas.append({
+            "weights": pesos,
+            "metrics": metricas,
+        })
+
+    if not evaluadas:
+        return {}
+
+    minima_varianza = min(
+        evaluadas,
+        key=lambda x: x["metrics"]["volatilidad_anualizada"],
+    )
+
+    maximo_sharpe = max(
+        evaluadas,
+        key=lambda x: x["metrics"]["sharpe_ratio"],
+    )
+
+    return {
+        "minima_varianza": minima_varianza,
+        "maximo_sharpe": maximo_sharpe,
+        "evaluadas": evaluadas,
+    }
+
+
+def generar_interpretacion_comparador(
+    portfolios: List[Dict[str, Any]],
+) -> str:
+
+    if not portfolios:
+        return (
+            "No fue posible generar una comparación académica de carteras con la información disponible."
+        )
+
+    usuario = next((p for p in portfolios if p.get("id") == "usuario"), None)
+
+    menor_volatilidad = min(
+        portfolios,
+        key=lambda x: x["metrics"]["volatilidad_anualizada"],
+    )
+
+    mayor_sharpe = max(
+        portfolios,
+        key=lambda x: x["metrics"]["sharpe_ratio"],
+    )
+
+    if usuario:
+        texto_usuario = (
+            f"La cartera construida por el usuario presenta una rentabilidad anualizada histórica "
+            f"de {usuario['metrics']['rentabilidad_anualizada'] * 100:.2f}%, una volatilidad "
+            f"de {usuario['metrics']['volatilidad_anualizada'] * 100:.2f}% y un ratio de Sharpe "
+            f"de {usuario['metrics']['sharpe_ratio']:.2f}. "
+        )
+    else:
+        texto_usuario = ""
+
+    return (
+        texto_usuario
+        + f"Al comparar las carteras académicas de referencia, la alternativa con menor volatilidad "
+        f"histórica es '{menor_volatilidad['name']}', mientras que la alternativa con mejor relación "
+        f"rentabilidad-riesgo histórica, medida por el ratio de Sharpe, es '{mayor_sharpe['name']}'. "
+        f"Estos resultados no deben entenderse como una recomendación personalizada de inversión, "
+        f"sino como una comparación académica que permite observar cómo cambian las métricas cuando "
+        f"se modifican los pesos de los activos bajo las restricciones del perfil."
+    )
+
+
+@app.post("/api/portfolio/compare")
+def comparar_carteras_academicas(request: PortfolioCompareRequest):
+
+    if not request.selected_assets:
+        raise HTTPException(
+            status_code=400,
+            detail="No se recibieron activos seleccionados para comparar carteras.",
+        )
+
+    tickers = obtener_tickers_activos(request.selected_assets)
+
+    if not tickers:
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontraron tickers válidos.",
+        )
+
+    restricciones = obtener_restricciones_comparador(request.resultado)
+
+    validacion_usuario = validar_portafolio_academico(
+        PortfolioValidationRequest(
+            resultado=request.resultado,
+            selected_assets=request.selected_assets,
+            weights=request.user_weights,
+        )
+    )
+
+    if not validacion_usuario.get("is_valid"):
+        return {
+            "status": "error",
+            "modulo": "portfolio-compare",
+            "validation": validacion_usuario,
+            "mensaje": (
+                "La cartera del usuario no puede compararse porque no cumple las restricciones "
+                "académicas del perfil."
+            ),
+        }
+
+    precios = descargar_precios_yfinance_simulacion(
+        tickers=tickers,
+        period=request.period or "2y",
+        start_date=request.start_date,
+        end_date=request.end_date,
+    )
+
+    precios = precios[tickers].dropna()
+    precios = aplicar_marco_temporal(precios, request.timeframe or "mensual")
+
+    retornos = precios.pct_change().dropna()
+
+    if retornos.empty:
+        raise HTTPException(
+            status_code=400,
+            detail="No fue posible calcular retornos para comparar las carteras.",
+        )
+
+    factor = obtener_factor_anualizacion(request.timeframe or "mensual")
+    risk_free_rate = float(request.risk_free_rate or 0.0)
+
+    portfolios = []
+
+    # 1. Cartera del usuario
+    user_metrics = calcular_metricas_de_pesos(
+        retornos=retornos,
+        weights_pct=request.user_weights,
+        tickers=tickers,
+        factor=factor,
+        risk_free_rate=risk_free_rate,
+    )
+
+    user_series = construir_series_portafolio(
+        retornos=retornos,
+        weights_pct=request.user_weights,
+        tickers=tickers,
+    )
+
+    portfolios.append({
+        "id": "usuario",
+        "name": "Cartera del usuario",
+        "type": "manual",
+        "description": (
+            "Cartera construida manualmente por el usuario y validada contra las restricciones "
+            "académicas de su perfil."
+        ),
+        "weights": {
+            ticker: round(float(request.user_weights.get(ticker, 0)), 4)
+            for ticker in tickers
+        },
+        "composition": obtener_composicion_por_clase(request.user_weights, request.selected_assets),
+        "metrics": user_metrics,
+        "series": user_series,
+    })
+
+    # 2. Cartera equiponderada restringida
+    pesos_equal = construir_cartera_equiponderada_restringida(
+        selected_assets=request.selected_assets,
+        restricciones=restricciones,
+    )
+
+    if pesos_equal:
+        portfolios.append({
+            "id": "equiponderada_restringida",
+            "name": "Equiponderada restringida",
+            "type": "academic_reference",
+            "description": (
+                "Distribuye el capital en partes iguales entre los activos seleccionados, siempre que "
+                "cumpla los límites máximos por activo y las restricciones del perfil."
+            ),
+            "weights": pesos_equal,
+            "composition": obtener_composicion_por_clase(pesos_equal, request.selected_assets),
+            "metrics": calcular_metricas_de_pesos(
+                retornos=retornos,
+                weights_pct=pesos_equal,
+                tickers=tickers,
+                factor=factor,
+                risk_free_rate=risk_free_rate,
+            ),
+            "series": construir_series_portafolio(retornos, pesos_equal, tickers),
+        })
+
+    # 3. Cartera modelo académica según perfil
+    pesos_modelo = construir_cartera_modelo_perfil(
+        selected_assets=request.selected_assets,
+        restricciones=restricciones,
+    )
+
+    if pesos_modelo:
+        portfolios.append({
+            "id": "modelo_perfil",
+            "name": "Modelo académico por perfil",
+            "type": "academic_reference",
+            "description": (
+                "Cartera de referencia construida a partir de la matriz riesgo-conocimiento y las "
+                "restricciones académicas del perfil. No representa una recomendación personalizada."
+            ),
+            "weights": pesos_modelo,
+            "composition": obtener_composicion_por_clase(pesos_modelo, request.selected_assets),
+            "metrics": calcular_metricas_de_pesos(
+                retornos=retornos,
+                weights_pct=pesos_modelo,
+                tickers=tickers,
+                factor=factor,
+                risk_free_rate=risk_free_rate,
+            ),
+            "series": construir_series_portafolio(retornos, pesos_modelo, tickers),
+        })
+
+    # 4. Monte Carlo restringido para mínima varianza y máximo Sharpe
+    cantidad_mc = int(request.monte_carlo_portfolios or 3000)
+    cantidad_mc = max(500, min(cantidad_mc, 10000))
+
+    candidatos = generar_pesos_aleatorios_restringidos(
+        selected_assets=request.selected_assets,
+        restricciones=restricciones,
+        cantidad=cantidad_mc,
+        seed=42,
+    )
+
+    seleccion_mc = seleccionar_mejores_carteras_montecarlo(
+        candidatos=candidatos,
+        retornos=retornos,
+        tickers=tickers,
+        factor=factor,
+        risk_free_rate=risk_free_rate,
+    )
+
+    if seleccion_mc.get("minima_varianza"):
+        pesos_min_var = seleccion_mc["minima_varianza"]["weights"]
+
+        portfolios.append({
+            "id": "minima_varianza",
+            "name": "Mínima volatilidad histórica",
+            "type": "optimization_reference",
+            "description": (
+                "Cartera académica que busca la menor volatilidad histórica dentro de las restricciones "
+                "del perfil y los activos seleccionados."
+            ),
+            "weights": pesos_min_var,
+            "composition": obtener_composicion_por_clase(pesos_min_var, request.selected_assets),
+            "metrics": seleccion_mc["minima_varianza"]["metrics"],
+            "series": construir_series_portafolio(retornos, pesos_min_var, tickers),
+        })
+
+    if seleccion_mc.get("maximo_sharpe"):
+        pesos_max_sharpe = seleccion_mc["maximo_sharpe"]["weights"]
+
+        portfolios.append({
+            "id": "maximo_sharpe",
+            "name": "Máximo Sharpe histórico",
+            "type": "optimization_reference",
+            "description": (
+                "Cartera académica que busca la mejor relación histórica entre rentabilidad y riesgo, "
+                "medida mediante el ratio de Sharpe, respetando las restricciones del perfil."
+            ),
+            "weights": pesos_max_sharpe,
+            "composition": obtener_composicion_por_clase(pesos_max_sharpe, request.selected_assets),
+            "metrics": seleccion_mc["maximo_sharpe"]["metrics"],
+            "series": construir_series_portafolio(retornos, pesos_max_sharpe, tickers),
+        })
+
+    comparison_table = []
+
+    for portfolio in portfolios:
+        comparison_table.append({
+            "id": portfolio["id"],
+            "name": portfolio["name"],
+            "rentabilidad_anualizada": portfolio["metrics"]["rentabilidad_anualizada"],
+            "volatilidad_anualizada": portfolio["metrics"]["volatilidad_anualizada"],
+            "sharpe_ratio": portfolio["metrics"]["sharpe_ratio"],
+            "max_drawdown": portfolio["metrics"]["max_drawdown"],
+            "var_95_historico": portfolio["metrics"]["var_95_historico"],
+            "cvar_95_historico": portfolio["metrics"]["cvar_95_historico"],
+            "renta_fija": portfolio["composition"]["renta_fija"],
+            "renta_variable": portfolio["composition"]["renta_variable"],
+            "otros": portfolio["composition"]["otros"],
+        })
+
+    risk_return_points = [
+        {
+            "id": portfolio["id"],
+            "name": portfolio["name"],
+            "risk": portfolio["metrics"]["volatilidad_anualizada"],
+            "return": portfolio["metrics"]["rentabilidad_anualizada"],
+            "sharpe": portfolio["metrics"]["sharpe_ratio"],
+        }
+        for portfolio in portfolios
+    ]
+
+    best_by_criteria = {
+        "menor_volatilidad": min(
+            portfolios,
+            key=lambda x: x["metrics"]["volatilidad_anualizada"],
+        )["name"],
+        "mayor_sharpe": max(
+            portfolios,
+            key=lambda x: x["metrics"]["sharpe_ratio"],
+        )["name"],
+        "mayor_rentabilidad": max(
+            portfolios,
+            key=lambda x: x["metrics"]["rentabilidad_anualizada"],
+        )["name"],
+        "menor_drawdown": max(
+            portfolios,
+            key=lambda x: x["metrics"]["max_drawdown"],
+        )["name"],
+    }
+
+    respuesta = {
+        "status": "ok",
+        "modulo": "portfolio-compare",
+        "validation": validacion_usuario,
+        "restricciones": restricciones,
+        "parametros": {
+            "period": request.period,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "timeframe": request.timeframe,
+            "annualization_factor": factor,
+            "risk_free_rate": risk_free_rate,
+            "monte_carlo_portfolios": len(candidatos),
+        },
+        "fecha_inicio": str(precios.index.min().date()),
+        "fecha_fin": str(precios.index.max().date()),
+        "numero_observaciones": int(len(precios)),
+        "portfolios": portfolios,
+        "comparison_table": comparison_table,
+        "risk_return_points": risk_return_points,
+        "best_by_criteria": best_by_criteria,
+        "academic_interpretation": generar_interpretacion_comparador(portfolios),
+        "advertencia": (
+            "Las carteras comparadas tienen finalidad académica y se construyen con base en datos "
+            "históricos y restricciones del perfil. No constituyen asesoría financiera personalizada, "
+            "recomendación de inversión ni garantía de resultados futuros."
+        ),
+    }
+
+    return limpiar_valores_json(respuesta)
+    
