@@ -390,6 +390,9 @@ def evaluar_perfil_academico(request: ProfileRequest):
         "restricciones": restrictions,
         "mensaje_academico": message,
         "restricciones_resumen": restricciones_resumen,
+        "fecha_evaluacion_utc": datetime.now(timezone.utc).isoformat(),
+        "profile_version": "1.0",
+        "profile_type": "perfil_academico_inversionista",
     }
 
     return {
