@@ -2192,7 +2192,6 @@ def distribuir_peso_en_grupo(
         if peso > 0.0001
     }
 
-```python
 def construir_cartera_equiponderada_por_bloques(
     selected_assets: List[Dict[str, Any]],
     restricciones: Dict[str, Any],
