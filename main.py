@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.16",
+    version="0.2.17",
 )
 
 app.add_middleware(
@@ -26,8 +26,9 @@ app.add_middleware(
         "http://localhost:3000",
         "https://clarum-invest.lovable.app",
         "https://lovable.dev",
+        "https://6716b82a-bd92-43a5-8cb8-811bf1b282b9.lovableproject.com",
     ],
-    allow_origin_regex=r"https://.*\.lovable\.app",
+    allow_origin_regex=r"https://.*\.(lovable\.app|lovableproject\.com)$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -769,7 +770,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.16",
+        "version": "0.2.17",
     }
 
 
@@ -778,7 +779,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.16",
+        "version": "0.2.17",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
