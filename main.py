@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.14",
+    version="0.2.15",
 )
 
 app.add_middleware(
@@ -660,8 +660,8 @@ def generar_explicacion(
     rentabilidad_pct = rentabilidad_anual * 100
     volatilidad_pct = volatilidad_anual * 100
     drawdown_pct = max_drawdown * 100
-    var_pct = var_95 * 100
-    cvar_pct = cvar_95 * 100
+    var_loss_pct = abs(var_95) * 100
+    cvar_loss_pct = abs(cvar_95) * 100
 
     if volatilidad_anual < 0.10:
         nivel_riesgo = "bajo"
@@ -672,13 +672,14 @@ def generar_explicacion(
 
     return (
         f"El portafolio analizado con los activos {', '.join(activos)} presenta una "
-        f"rentabilidad anualizada aproximada de {rentabilidad_pct:.2f}% y una volatilidad "
-        f"anualizada de {volatilidad_pct:.2f}%. En términos sencillos, la rentabilidad "
-        f"muestra cuánto habría crecido el portafolio en promedio anual según los datos "
-        f"históricos, mientras que la volatilidad indica qué tanto pueden variar sus resultados. "
-        f"Con base en la volatilidad observada, el nivel de riesgo histórico se clasifica como "
-        f"{nivel_riesgo}. El máximo drawdown fue de {drawdown_pct:.2f}%. El VaR histórico "
-        f"diario al 95% fue de {var_pct:.2f}% y el CVaR fue de {cvar_pct:.2f}%."
+        f"rentabilidad anualizada logarítmica aproximada de {rentabilidad_pct:.2f}% "
+        f"y una volatilidad anualizada de {volatilidad_pct:.2f}%. En términos sencillos, "
+        f"la rentabilidad muestra cómo se comportó el portafolio en promedio anual según "
+        f"los datos históricos, usando retornos logarítmicos. La volatilidad indica qué tanto "
+        f"variaron sus resultados. Con base en la volatilidad observada, el nivel de riesgo "
+        f"histórico se clasifica como {nivel_riesgo}. El máximo drawdown fue de "
+        f"{drawdown_pct:.2f}%. El VaR histórico diario al 95% fue de {var_loss_pct:.2f}% "
+        f"de pérdida y el CVaR fue de {cvar_loss_pct:.2f}% de pérdida."
     )
 
 
@@ -692,26 +693,31 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pesos = obtener_pesos(payload, activos)
 
-    retornos_diarios = precios.pct_change().dropna()
+    # Retornos logarítmicos diarios.
+    # Se usan para calcular rentabilidad, volatilidad, VaR, CVaR, correlación y Sharpe.
+    retornos_diarios = np.log(precios / precios.shift(1)).dropna()
 
     if retornos_diarios.empty:
-        raise HTTPException(status_code=400, detail="No fue posible calcular retornos diarios.")
+        raise HTTPException(status_code=400, detail="No fue posible calcular retornos logarítmicos diarios.")
 
     retornos_portafolio = retornos_diarios.dot(pesos)
 
     rentabilidad_anual = float(retornos_portafolio.mean() * 252)
     volatilidad_anual = float(retornos_portafolio.std() * np.sqrt(252))
 
-    acumulado = (1 + retornos_portafolio).cumprod()
+    # Evolución acumulada usando retornos logarítmicos.
+    acumulado = np.exp(retornos_portafolio.cumsum())
     maximo_acumulado = acumulado.cummax()
     drawdown = acumulado / maximo_acumulado - 1
     max_drawdown = float(drawdown.min())
 
+    # VaR y CVaR sobre retornos logarítmicos.
+    # Se devuelven como valores negativos cuando representan pérdidas.
     percentil_5 = float(np.percentile(retornos_portafolio, 5))
-    var_95 = max(0.0, -percentil_5)
+    var_95 = percentil_5
 
     retornos_en_cola = retornos_portafolio[retornos_portafolio <= percentil_5]
-    cvar_95 = max(0.0, -float(retornos_en_cola.mean())) if len(retornos_en_cola) > 0 else 0.0
+    cvar_95 = float(retornos_en_cola.mean()) if len(retornos_en_cola) > 0 else var_95
 
     correlacion = retornos_diarios.corr().round(4).to_dict()
 
@@ -746,10 +752,12 @@ def calcular_metricas_financieras(payload: Dict[str, Any]) -> Dict[str, Any]:
             "max_drawdown": round(max_drawdown, 6),
             "var_95_historico_diario": round(var_95, 6),
             "cvar_95_historico_diario": round(cvar_95, 6),
+            "return_method": "log_returns",
         },
         "metricas_individuales": {
             "rentabilidad_anualizada": rentabilidades_individuales,
             "volatilidad_anualizada": volatilidades_individuales,
+            "return_method": "log_returns",
         },
         "matriz_correlacion": correlacion,
         "explicacion_lenguaje_natural": explicacion,
@@ -761,7 +769,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.14",
+        "version": "0.2.15",
     }
 
 
@@ -770,7 +778,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.14",
+        "version": "0.2.15",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1328,9 +1336,13 @@ def obtener_catalogo_activos():
 
 #==================================================
 
+#==================================================
+
 # ============================================================
 # MÓDULO MÉTRICAS HISTÓRICAS INDIVIDUALES POR ACTIVO
-# Endpoint: POST /api/assets/risk-metrics
+# Endpoints:
+#   POST /api/assets/metrics250
+#   POST /api/assets/risk-metrics
 # ============================================================
 
 class AssetRiskMetricsRequest(BaseModel):
@@ -1491,15 +1503,6 @@ def calcular_metricas_individuales_activo(
     rentabilidad_log_anualizada = float(retornos.mean() * 252)
     rentabilidad_log_acumulada = float(retornos.sum())
 
-    precio_inicial = float(precios_ventana.iloc[0])
-    precio_final = float(precios_ventana.iloc[-1])
-
-    rentabilidad_simple_acumulada = (
-    (precio_final / precio_inicial) - 1
-    if precio_inicial > 0
-    else None
-    )
-
     volatilidad_anualizada = float(retornos.std(ddof=1) * np.sqrt(252))
 
     tail_probability = 1.0 - confidence_level
@@ -1522,28 +1525,12 @@ def calcular_metricas_individuales_activo(
         "observations": int(len(retornos)),
         "start_date": str(retornos.index.min().date()),
         "end_date": str(retornos.index.max().date()),
-
-        # Rentabilidad calculada con retornos logarítmicos.
         "annualized_log_return": round(rentabilidad_log_anualizada, 6),
         "cumulative_log_return": round(rentabilidad_log_acumulada, 6),
-
-        # Rentabilidad acumulada simple equivalente para lectura del usuario.
-        "cumulative_simple_return": (
-        round(float(rentabilidad_simple_acumulada), 6)
-        if rentabilidad_simple_acumulada is not None
-        else None
-        ),
-
-        # Riesgo calculado sobre retornos logarítmicos.
         "annualized_volatility": round(volatilidad_anualizada, 6),
-
-        # Se devuelven negativos porque representan pérdida.
         "var_95_daily": round(var_daily, 6),
         "cvar_95_daily": round(cvar_daily, 6),
-
-        # Drawdown calculado sobre la serie de precios.
         "max_drawdown_250d": round(max_drawdown, 6),
-
         "last_price": round(float(serie.iloc[-1]), 6),
         "price_source": fuente,
         "data_source": "backend_historical_prices",
@@ -1693,13 +1680,16 @@ def obtener_metricas_riesgo_activos(request: AssetRiskMetricsRequest):
         "elapsed_seconds": elapsed_seconds,
         "metrics": metrics,
         "unavailable_tickers": unavailable_tickers,
+        "return_method": "log_returns",
         "advertencia": (
-            "Estas métricas se calculan con datos históricos y tienen finalidad académica. "
-            "No constituyen recomendación de inversión ni garantizan resultados futuros."
+            "Estas métricas se calculan con datos históricos mediante retornos logarítmicos "
+            "y tienen finalidad académica. No constituyen recomendación de inversión ni "
+            "garantizan resultados futuros."
         ),
     }
 
     return limpiar_valores_json(respuesta)
+
 
 # ============================================================
 # MÓDULO VALIDACIÓN DE PORTAFOLIO SEGÚN RESTRICCIONES
@@ -2130,8 +2120,8 @@ def generar_explicacion_simulacion(
     rentabilidad_pct = rentabilidad_anual * 100
     volatilidad_pct = volatilidad_anual * 100
     drawdown_pct = max_drawdown * 100
-    var_pct = var_95 * 100
-    cvar_pct = cvar_95 * 100
+    var_loss_pct = abs(var_95) * 100
+    cvar_loss_pct = abs(cvar_95) * 100
 
     if volatilidad_anual < 0.10:
         nivel_riesgo = "bajo"
@@ -2142,15 +2132,15 @@ def generar_explicacion_simulacion(
 
     return (
         f"La simulación histórica del portafolio compuesto por {', '.join(activos)} "
-        f"muestra una rentabilidad anualizada aproximada de {rentabilidad_pct:.2f}% "
+        f"muestra una rentabilidad anualizada logarítmica aproximada de {rentabilidad_pct:.2f}% "
         f"y una volatilidad anualizada de {volatilidad_pct:.2f}%, usando un marco temporal "
-        f"{timeframe}. En términos sencillos, la rentabilidad indica cuánto habría crecido "
-        f"el portafolio en promedio anual según los datos históricos, mientras que la volatilidad "
-        f"muestra qué tan fuertes fueron sus variaciones. Con base en la volatilidad observada, "
-        f"el riesgo histórico se clasifica como {nivel_riesgo}. El máximo drawdown fue de "
-        f"{drawdown_pct:.2f}%, lo que representa la mayor caída histórica desde un máximo hasta "
-        f"un mínimo dentro del periodo analizado. El VaR histórico al 95% fue de {var_pct:.2f}% "
-        f"y el CVaR fue de {cvar_pct:.2f}%, indicadores que permiten observar pérdidas históricas "
+        f"{timeframe}. En términos sencillos, la rentabilidad se calculó con retornos logarítmicos "
+        f"a partir de los datos históricos, mientras que la volatilidad muestra qué tan fuertes "
+        f"fueron sus variaciones. Con base en la volatilidad observada, el riesgo histórico se "
+        f"clasifica como {nivel_riesgo}. El máximo drawdown fue de {drawdown_pct:.2f}%, lo que "
+        f"representa la mayor caída histórica desde un máximo hasta un mínimo dentro del periodo "
+        f"analizado. El VaR histórico al 95% fue de {var_loss_pct:.2f}% de pérdida y el CVaR fue "
+        f"de {cvar_loss_pct:.2f}% de pérdida, indicadores que permiten observar pérdidas históricas "
         f"en escenarios desfavorables. El ratio de Sharpe fue de {sharpe_ratio:.2f}, lo que permite "
         f"relacionar la rentabilidad obtenida con el riesgo asumido. Estos resultados no predicen "
         f"el futuro y tienen finalidad exclusivamente académica."
@@ -2217,12 +2207,15 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
     precios = precios[tickers].dropna()
     precios = aplicar_marco_temporal(precios, request.timeframe or "diario")
 
-    retornos = precios.pct_change().dropna()
+    # Retornos logarítmicos del periodo seleccionado por el usuario.
+    # Rentabilidad, volatilidad, VaR, CVaR, correlación, Sharpe y métricas individuales
+    # se calculan con retornos logarítmicos.
+    retornos = np.log(precios / precios.shift(1)).dropna()
 
     if retornos.empty:
         raise HTTPException(
             status_code=400,
-            detail="No fue posible calcular retornos para la simulación.",
+            detail="No fue posible calcular retornos logarítmicos para la simulación.",
         )
 
     factor = obtener_factor_anualizacion(request.timeframe or "diario")
@@ -2236,23 +2229,26 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         if request.risk_free_rate_annual is not None
         else (request.risk_free_rate or 0.0)
     )
-    
+
     sharpe_ratio = (
         (rentabilidad_anual - risk_free_rate) / volatilidad_anual
         if volatilidad_anual > 0
         else 0.0
     )
 
-    acumulado = (1 + retornos_portafolio).cumprod()
+    # Evolución acumulada del portafolio usando retornos logarítmicos.
+    acumulado = np.exp(retornos_portafolio.cumsum())
     maximo_acumulado = acumulado.cummax()
     drawdown = acumulado / maximo_acumulado - 1
     max_drawdown = float(drawdown.min())
 
+    # VaR y CVaR calculados sobre retornos logarítmicos.
+    # Se devuelven como valores negativos porque representan pérdidas.
     percentil_5 = float(np.percentile(retornos_portafolio, 5))
-    var_95 = max(0.0, -percentil_5)
+    var_95 = percentil_5
 
     retornos_cola = retornos_portafolio[retornos_portafolio <= percentil_5]
-    cvar_95 = max(0.0, -float(retornos_cola.mean())) if len(retornos_cola) > 0 else 0.0
+    cvar_95 = float(retornos_cola.mean()) if len(retornos_cola) > 0 else var_95
 
     correlacion = retornos.corr().round(4).to_dict()
 
@@ -2324,6 +2320,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         "annualization_factor": factor,
         "risk_free_rate": risk_free_rate,
         "risk_free_rate_annual_used": risk_free_rate,
+        "return_method": "log_returns",
     },
     "fecha_inicio": str(precios.index.min().date()),
     "fecha_fin": str(precios.index.max().date()),
@@ -2335,10 +2332,12 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         "max_drawdown": round(max_drawdown, 6),
         "var_95_historico": round(var_95, 6),
         "cvar_95_historico": round(cvar_95, 6),
+        "return_method": "log_returns",
     },
     "metricas_individuales": {
         "rentabilidad_anualizada": rentabilidades_individuales,
         "volatilidad_anualizada": volatilidades_individuales,
+        "return_method": "log_returns",
     },
     "matriz_correlacion": correlacion,
     "performance_series": performance_series,
@@ -2923,15 +2922,18 @@ def calcular_metricas_de_pesos(
         else 0.0
     )
 
-    acumulado = (1 + retornos_portafolio).cumprod()
+    # Evolución acumulada usando retornos logarítmicos.
+    acumulado = np.exp(retornos_portafolio.cumsum())
     drawdown = acumulado / acumulado.cummax() - 1
     max_drawdown = float(drawdown.min())
 
+    # VaR y CVaR sobre retornos logarítmicos.
+    # Se devuelven como valores negativos cuando representan pérdidas.
     percentil_5 = float(np.percentile(retornos_portafolio, 5))
-    var_95 = max(0.0, -percentil_5)
+    var_95 = percentil_5
 
     cola = retornos_portafolio[retornos_portafolio <= percentil_5]
-    cvar_95 = max(0.0, -float(cola.mean())) if len(cola) > 0 else 0.0
+    cvar_95 = float(cola.mean()) if len(cola) > 0 else var_95
 
     return {
         "rentabilidad_anualizada": round(rentabilidad_anual, 6),
@@ -2940,6 +2942,7 @@ def calcular_metricas_de_pesos(
         "max_drawdown": round(max_drawdown, 6),
         "var_95_historico": round(var_95, 6),
         "cvar_95_historico": round(cvar_95, 6),
+        "return_method": "log_returns",
     }
 
 
@@ -2952,7 +2955,8 @@ def construir_series_portafolio(
     vector = pesos_dict_a_vector(weights_pct, tickers)
     retornos_portafolio = retornos.dot(vector)
 
-    acumulado = (1 + retornos_portafolio).cumprod()
+    # Serie acumulada compatible con retornos logarítmicos.
+    acumulado = np.exp(retornos_portafolio.cumsum())
     drawdown = acumulado / acumulado.cummax() - 1
 
     performance_series = [
@@ -3044,7 +3048,7 @@ def generar_interpretacion_comparador(
 
     if usuario:
         texto_usuario = (
-            f"La cartera construida por el usuario presenta una rentabilidad anualizada histórica "
+            f"La cartera construida por el usuario presenta una rentabilidad anualizada logarítmica histórica "
             f"de {usuario['metrics']['rentabilidad_anualizada'] * 100:.2f}%, una volatilidad "
             f"de {usuario['metrics']['volatilidad_anualizada'] * 100:.2f}% y un ratio de Sharpe "
             f"de {usuario['metrics']['sharpe_ratio']:.2f}. "
@@ -3111,12 +3115,13 @@ def comparar_carteras_academicas(request: PortfolioCompareRequest):
     precios = precios[tickers].dropna()
     precios = aplicar_marco_temporal(precios, request.timeframe or "mensual")
 
-    retornos = precios.pct_change().dropna()
+    # Retornos logarítmicos para comparación de carteras.
+    retornos = np.log(precios / precios.shift(1)).dropna()
 
     if retornos.empty:
         raise HTTPException(
             status_code=400,
-            detail="No fue posible calcular retornos para comparar las carteras.",
+            detail="No fue posible calcular retornos logarítmicos para comparar las carteras.",
         )
 
     factor = obtener_factor_anualizacion(request.timeframe or "mensual")
@@ -3359,6 +3364,7 @@ def comparar_carteras_academicas(request: PortfolioCompareRequest):
             "annualization_factor": factor,
             "risk_free_rate": risk_free_rate,
             "monte_carlo_portfolios": len(candidatos),
+            "return_method": "log_returns",
         },
         "fecha_inicio": str(precios.index.min().date()),
         "fecha_fin": str(precios.index.max().date()),
@@ -3376,4 +3382,3 @@ def comparar_carteras_academicas(request: PortfolioCompareRequest):
     }
 
     return limpiar_valores_json(respuesta)
-    
