@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.11",
+    version="0.2.12",
 )
 
 app.add_middleware(
@@ -761,7 +761,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.11",
+        "version": "0.2.12",
     }
 
 
@@ -770,7 +770,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.11",
+        "version": "0.2.12",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1329,6 +1329,348 @@ def obtener_catalogo_activos():
 #==================================================
 
 # ============================================================
+# MÓDULO MÉTRICAS HISTÓRICAS INDIVIDUALES POR ACTIVO
+# Endpoint: POST /api/assets/risk-metrics
+# ============================================================
+
+class AssetRiskMetricsRequest(BaseModel):
+    tickers: List[str]
+    lookback_observations: int = 250
+    timeframe: str = "1d"
+    confidence_level: float = 0.95
+
+
+ASSET_RISK_METRICS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+ASSET_RISK_CACHE_TTL_OK_SECONDS = 12 * 60 * 60
+ASSET_RISK_CACHE_TTL_ERROR_SECONDS = 5 * 60
+
+
+def limpiar_tickers_metricas(tickers: List[str]) -> List[str]:
+    tickers_limpios = []
+    vistos = set()
+
+    for ticker in tickers:
+        ticker_limpio = str(ticker).strip().upper()
+
+        if not ticker_limpio:
+            continue
+
+        if ticker_limpio not in vistos:
+            tickers_limpios.append(ticker_limpio)
+            vistos.add(ticker_limpio)
+
+    return tickers_limpios
+
+
+def generar_cache_key_metricas(
+    ticker: str,
+    lookback_observations: int,
+    timeframe: str,
+    confidence_level: float,
+) -> str:
+    return (
+        f"{ticker}|"
+        f"{lookback_observations}|"
+        f"{timeframe}|"
+        f"{confidence_level}"
+    )
+
+
+def obtener_metricas_desde_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    item = ASSET_RISK_METRICS_CACHE.get(cache_key)
+
+    if not item:
+        return None
+
+    created_at = float(item.get("created_at", 0))
+    ttl_seconds = float(item.get("ttl_seconds", ASSET_RISK_CACHE_TTL_OK_SECONDS))
+
+    if (datetime.now(timezone.utc).timestamp() - created_at) > ttl_seconds:
+        ASSET_RISK_METRICS_CACHE.pop(cache_key, None)
+        return None
+
+    return item.get("data")
+
+
+def guardar_metricas_en_cache(
+    cache_key: str,
+    data: Dict[str, Any],
+    ttl_seconds: int,
+) -> None:
+    ASSET_RISK_METRICS_CACHE[cache_key] = {
+        "created_at": datetime.now(timezone.utc).timestamp(),
+        "ttl_seconds": ttl_seconds,
+        "data": data,
+    }
+
+
+def preparar_serie_para_metricas(
+    ticker: str,
+    lookback_observations: int,
+) -> Dict[str, Any]:
+    """
+    Usa la arquitectura actual del backend:
+    descargar_precio_activo intenta yahoo_chart, yfinance y stooq.
+
+    Para obtener 250 retornos se necesitan al menos 251 precios.
+    Por prudencia se descarga un periodo amplio.
+    """
+
+    if lookback_observations <= 250:
+        periodo_descarga = "2y"
+    elif lookback_observations <= 500:
+        periodo_descarga = "3y"
+    else:
+        periodo_descarga = "7y"
+
+    resultado_descarga = descargar_precio_activo(
+        ticker=ticker,
+        periodo=periodo_descarga,
+    )
+
+    serie = resultado_descarga["serie"]
+    fuente = resultado_descarga["fuente"]
+
+    serie = pd.to_numeric(serie, errors="coerce").dropna()
+    serie = serie.sort_index()
+
+    # Evita que se use cualquier fecha futura si alguna fuente la entrega por error.
+    hoy = pd.Timestamp(datetime.now().date())
+    serie = serie[serie.index <= hoy]
+
+    if serie.empty or len(serie) < 61:
+        raise ValueError("No hay suficientes precios históricos disponibles.")
+
+    return {
+        "ticker": ticker,
+        "fuente": fuente,
+        "serie": serie,
+    }
+
+
+def calcular_metricas_individuales_activo(
+    ticker: str,
+    lookback_observations: int,
+    confidence_level: float,
+) -> Dict[str, Any]:
+    resultado_serie = preparar_serie_para_metricas(
+        ticker=ticker,
+        lookback_observations=lookback_observations,
+    )
+
+    serie = resultado_serie["serie"]
+    fuente = resultado_serie["fuente"]
+
+    # Para N retornos se necesitan N + 1 precios.
+    precios_ventana = serie.tail(lookback_observations + 1)
+
+    retornos = precios_ventana.pct_change().dropna()
+    retornos = retornos.tail(lookback_observations)
+
+    if retornos.empty or len(retornos) < 60:
+        return {
+            "status": "unavailable",
+            "reason": "No hay suficientes observaciones históricas para calcular métricas confiables.",
+        }
+
+    # Alinea precios usados para drawdown con el rango de retornos.
+    fecha_inicio_retornos = retornos.index.min()
+    fecha_fin_retornos = retornos.index.max()
+
+    precios_drawdown = precios_ventana[
+        (precios_ventana.index >= fecha_inicio_retornos) &
+        (precios_ventana.index <= fecha_fin_retornos)
+    ]
+
+    if precios_drawdown.empty or len(precios_drawdown) < 2:
+        precios_drawdown = precios_ventana.tail(len(retornos) + 1)
+
+    volatilidad_anualizada = float(retornos.std(ddof=1) * np.sqrt(252))
+
+    tail_probability = 1.0 - confidence_level
+
+    var_daily = float(np.percentile(retornos, tail_probability * 100))
+
+    retornos_cola = retornos[retornos <= var_daily]
+
+    if len(retornos_cola) > 0:
+        cvar_daily = float(retornos_cola.mean())
+    else:
+        cvar_daily = var_daily
+
+    maximo_acumulado = precios_drawdown.cummax()
+    drawdown = precios_drawdown / maximo_acumulado - 1
+    max_drawdown = float(drawdown.min())
+
+    return {
+        "status": "ok",
+        "observations": int(len(retornos)),
+        "start_date": str(retornos.index.min().date()),
+        "end_date": str(retornos.index.max().date()),
+        "annualized_volatility": round(volatilidad_anualizada, 6),
+
+        # Se devuelven negativos porque representan pérdida.
+        "var_95_daily": round(var_daily, 6),
+        "cvar_95_daily": round(cvar_daily, 6),
+        "max_drawdown_250d": round(max_drawdown, 6),
+
+        "last_price": round(float(serie.iloc[-1]), 6),
+        "price_source": fuente,
+        "data_source": "backend_historical_prices",
+    }
+
+
+@app.post("/api/assets/risk-metrics")
+def obtener_metricas_riesgo_activos(request: AssetRiskMetricsRequest):
+    tickers = limpiar_tickers_metricas(request.tickers or [])
+
+    if not tickers:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "message": "Debe enviar al menos un ticker.",
+            },
+        )
+
+    if len(tickers) > 50:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "message": "La solicitud supera el máximo de 50 tickers.",
+            },
+        )
+
+    lookback_observations = int(request.lookback_observations or 250)
+
+    if lookback_observations < 60 or lookback_observations > 1000:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "message": "lookback_observations debe estar entre 60 y 1000.",
+            },
+        )
+
+    timeframe = str(request.timeframe or "1d").strip().lower()
+
+    if timeframe != "1d":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "message": "Por ahora solo se soporta timeframe diario 1d para métricas individuales.",
+            },
+        )
+
+    confidence_level = float(request.confidence_level or 0.95)
+
+    if confidence_level < 0.90 or confidence_level > 0.99:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "error",
+                "message": "confidence_level debe estar entre 0.90 y 0.99.",
+            },
+        )
+
+    inicio_calculo = datetime.now(timezone.utc)
+
+    print(
+        "[asset-risk-metrics] "
+        f"tickers={tickers} "
+        f"lookback={lookback_observations} "
+        f"timeframe={timeframe} "
+        f"confidence={confidence_level}"
+    )
+
+    metrics = {}
+    unavailable_tickers = []
+
+    for ticker in tickers:
+        cache_key = generar_cache_key_metricas(
+            ticker=ticker,
+            lookback_observations=lookback_observations,
+            timeframe=timeframe,
+            confidence_level=confidence_level,
+        )
+
+        cached = obtener_metricas_desde_cache(cache_key)
+
+        if cached:
+            metrics[ticker] = cached
+
+            if cached.get("status") != "ok":
+                unavailable_tickers.append(ticker)
+
+            continue
+
+        try:
+            resultado = calcular_metricas_individuales_activo(
+                ticker=ticker,
+                lookback_observations=lookback_observations,
+                confidence_level=confidence_level,
+            )
+
+            metrics[ticker] = resultado
+
+            if resultado.get("status") == "ok":
+                guardar_metricas_en_cache(
+                    cache_key=cache_key,
+                    data=resultado,
+                    ttl_seconds=ASSET_RISK_CACHE_TTL_OK_SECONDS,
+                )
+            else:
+                unavailable_tickers.append(ticker)
+                guardar_metricas_en_cache(
+                    cache_key=cache_key,
+                    data=resultado,
+                    ttl_seconds=ASSET_RISK_CACHE_TTL_ERROR_SECONDS,
+                )
+
+        except Exception as error:
+            print(f"[asset-risk-metrics] error en {ticker}: {str(error)}")
+
+            resultado_error = {
+                "status": "unavailable",
+                "reason": "No se pudieron obtener datos históricos para este activo.",
+                "technical_detail": str(error),
+            }
+
+            metrics[ticker] = resultado_error
+            unavailable_tickers.append(ticker)
+
+            guardar_metricas_en_cache(
+                cache_key=cache_key,
+                data=resultado_error,
+                ttl_seconds=ASSET_RISK_CACHE_TTL_ERROR_SECONDS,
+            )
+
+    fin_calculo = datetime.now(timezone.utc)
+    elapsed_seconds = round((fin_calculo - inicio_calculo).total_seconds(), 3)
+
+    respuesta = {
+        "status": "ok",
+        "modulo": "asset_risk_metrics",
+        "lookback_observations": lookback_observations,
+        "timeframe": timeframe,
+        "confidence_level": confidence_level,
+        "data_source": "backend_historical_prices",
+        "generated_at": fin_calculo.isoformat(),
+        "elapsed_seconds": elapsed_seconds,
+        "metrics": metrics,
+        "unavailable_tickers": unavailable_tickers,
+        "advertencia": (
+            "Estas métricas se calculan con datos históricos y tienen finalidad académica. "
+            "No constituyen recomendación de inversión ni garantizan resultados futuros."
+        ),
+    }
+
+    return limpiar_valores_json(respuesta)
+
+# ============================================================
 # MÓDULO VALIDACIÓN DE PORTAFOLIO SEGÚN RESTRICCIONES
 # ============================================================
 
@@ -1597,6 +1939,7 @@ class PortfolioSimulationRequest(BaseModel):
     end_date: Optional[str] = None
     timeframe: Optional[str] = "diario"
     risk_free_rate: Optional[float] = 0.0
+    risk_free_rate_annual: Optional[float] = None
 
 
 def obtener_factor_anualizacion(timeframe: str) -> int:
@@ -1857,7 +2200,12 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
     rentabilidad_anual = float(retornos_portafolio.mean() * factor)
     volatilidad_anual = float(retornos_portafolio.std() * np.sqrt(factor))
 
-    risk_free_rate = float(request.risk_free_rate or 0.0)
+    risk_free_rate = float(
+        request.risk_free_rate_annual
+        if request.risk_free_rate_annual is not None
+        else (request.risk_free_rate or 0.0)
+    )
+    
     sharpe_ratio = (
         (rentabilidad_anual - risk_free_rate) / volatilidad_anual
         if volatilidad_anual > 0
@@ -1944,6 +2292,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         "timeframe": request.timeframe,
         "annualization_factor": factor,
         "risk_free_rate": risk_free_rate,
+        "risk_free_rate_annual_used": risk_free_rate,
     },
     "fecha_inicio": str(precios.index.min().date()),
     "fecha_fin": str(precios.index.max().date()),
