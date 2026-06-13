@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.15",
+    version="0.2.16",
 )
 
 app.add_middleware(
@@ -769,7 +769,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.15",
+        "version": "0.2.16",
     }
 
 
@@ -778,7 +778,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.15",
+        "version": "0.2.16",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -2428,6 +2428,7 @@ def obtener_composicion_por_clase(
     }
 
 
+
 def obtener_restricciones_comparador(resultado: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     restricciones = extraer_restricciones_desde_request(
         AllowedAssetsRequest(resultado=resultado or {})
@@ -2442,6 +2443,59 @@ def obtener_restricciones_comparador(resultado: Optional[Dict[str, Any]]) -> Dic
     }
 
 
+def obtener_max_weight_por_ticker(
+    selected_assets: List[Dict[str, Any]],
+    restricciones: Dict[str, Any],
+) -> Dict[str, float]:
+    """Devuelve el peso máximo permitido por activo.
+
+    En la validación general del perfil existe un máximo base por activo, pero el catálogo
+    académico permite pesos mayores para ETF diversificados. El comparador debe respetar
+    el límite específico de cada activo cuando esté disponible, porque de lo contrario el
+    motor de Monte Carlo descarta carteras válidas.
+    """
+
+    max_base = float(restricciones.get("max_weight_per_asset", 100))
+    mapa: Dict[str, float] = {}
+
+    for asset in selected_assets:
+        ticker = str(asset.get("ticker", "")).upper().strip()
+        if not ticker:
+            continue
+
+        candidatos = [
+            asset.get("max_weight_allowed"),
+            asset.get("max_weight"),
+            asset.get("max_weight_percentage"),
+        ]
+
+        max_activo = None
+        for valor in candidatos:
+            try:
+                if valor is not None and valor != "":
+                    max_activo = float(valor)
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        if max_activo is None:
+            max_activo = max_base
+
+        # Protección para evitar valores imposibles.
+        max_activo = max(0.0, min(float(max_activo), 100.0))
+        mapa[ticker] = max_activo
+
+    return mapa
+
+
+def obtener_capacidad_por_tickers(
+    tickers: List[str],
+    max_weight_by_ticker: Dict[str, float],
+    max_weight_default: float,
+) -> float:
+    return float(sum(max_weight_by_ticker.get(ticker, max_weight_default) for ticker in tickers))
+
+
 def validar_pesos_con_restricciones(
     weights_pct: Dict[str, float],
     selected_assets: List[Dict[str, Any]],
@@ -2453,17 +2507,20 @@ def validar_pesos_con_restricciones(
     if abs(total - 100.0) > 0.01:
         return False
 
-    max_weight = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_default = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_by_ticker = obtener_max_weight_por_ticker(selected_assets, restricciones)
     max_equity = float(restricciones.get("max_equity_percentage", 100))
     min_fixed = float(restricciones.get("min_fixed_income_percentage", 0))
 
-    for peso in weights_pct.values():
+    for ticker, peso in weights_pct.items():
+        ticker_limpio = str(ticker).upper().strip()
         peso_float = float(peso)
+        max_ticker = max_weight_by_ticker.get(ticker_limpio, max_weight_default)
 
         if peso_float < -0.0001:
             return False
 
-        if peso_float > max_weight + 0.0001:
+        if peso_float > max_ticker + 0.0001:
             return False
 
     composicion = obtener_composicion_por_clase(weights_pct, selected_assets)
@@ -2511,9 +2568,10 @@ def construir_cartera_equiponderada_restringida(
         return {}
 
     peso_base = 100.0 / n
-    max_weight = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_default = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_by_ticker = obtener_max_weight_por_ticker(selected_assets, restricciones)
 
-    if peso_base <= max_weight:
+    if all(peso_base <= max_weight_by_ticker.get(ticker, max_weight_default) + 0.0001 for ticker in tickers):
         weights = {ticker: round(peso_base, 4) for ticker in tickers}
 
         if validar_pesos_con_restricciones(weights, selected_assets, restricciones):
@@ -2526,50 +2584,68 @@ def distribuir_peso_en_grupo(
     tickers_grupo: List[str],
     peso_total: float,
     max_weight: float,
+    max_weight_by_ticker: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
 
     if not tickers_grupo or peso_total <= 0:
         return {}
 
-    capacidad_total = len(tickers_grupo) * max_weight
+    max_weight_by_ticker = max_weight_by_ticker or {}
+    caps = {
+        ticker: float(max_weight_by_ticker.get(ticker, max_weight))
+        for ticker in tickers_grupo
+    }
+
+    capacidad_total = sum(caps.values())
 
     if peso_total > capacidad_total + 0.0001:
         return {}
 
-    peso_inicial = peso_total / len(tickers_grupo)
+    n = len(tickers_grupo)
+    peso_inicial = peso_total / n
 
-    if peso_inicial <= max_weight:
+    if all(peso_inicial <= caps[ticker] + 0.0001 for ticker in tickers_grupo):
         return {
             ticker: round(peso_inicial, 4)
             for ticker in tickers_grupo
+            if peso_inicial > 0.0001
         }
 
     pesos = {ticker: 0.0 for ticker in tickers_grupo}
-    restante = peso_total
+    restante = float(peso_total)
     tickers_disponibles = tickers_grupo.copy()
 
     while restante > 0.0001 and tickers_disponibles:
         peso_por_ticker = restante / len(tickers_disponibles)
         nuevos_disponibles = []
+        progreso = False
 
         for ticker in tickers_disponibles:
-            asignacion = min(peso_por_ticker, max_weight - pesos[ticker])
-            pesos[ticker] += asignacion
-            restante -= asignacion
+            capacidad_ticker = max(0.0, caps[ticker] - pesos[ticker])
+            asignacion = min(peso_por_ticker, capacidad_ticker)
 
-            if pesos[ticker] < max_weight - 0.0001:
+            if asignacion > 0.0001:
+                pesos[ticker] += asignacion
+                restante -= asignacion
+                progreso = True
+
+            if pesos[ticker] < caps[ticker] - 0.0001:
                 nuevos_disponibles.append(ticker)
 
-        if len(nuevos_disponibles) == len(tickers_disponibles):
+        if not progreso:
             break
 
         tickers_disponibles = nuevos_disponibles
+
+    if restante > 0.01:
+        return {}
 
     return {
         ticker: round(peso, 4)
         for ticker, peso in pesos.items()
         if peso > 0.0001
     }
+
 
 def construir_cartera_equiponderada_por_bloques(
     selected_assets: List[Dict[str, Any]],
@@ -2579,6 +2655,7 @@ def construir_cartera_equiponderada_por_bloques(
     max_equity = float(restricciones.get("max_equity_percentage", 100))
     min_fixed = float(restricciones.get("min_fixed_income_percentage", 0))
     max_weight = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_by_ticker = obtener_max_weight_por_ticker(selected_assets, restricciones)
 
     tickers_renta_fija = []
     tickers_renta_variable = []
@@ -2595,18 +2672,20 @@ def construir_cartera_equiponderada_por_bloques(
         else:
             tickers_otros.append(ticker)
 
-    capacidad_renta_fija = len(tickers_renta_fija) * max_weight
-    capacidad_renta_variable = len(tickers_renta_variable) * max_weight
+    capacidad_renta_fija = obtener_capacidad_por_tickers(tickers_renta_fija, max_weight_by_ticker, max_weight)
+    capacidad_renta_variable = obtener_capacidad_por_tickers(tickers_renta_variable, max_weight_by_ticker, max_weight)
 
     if min_fixed > 0 and not tickers_renta_fija:
         return {}
 
-    peso_renta_fija = min_fixed
-    peso_renta_variable = 100.0 - peso_renta_fija
+    # El perfil puede permitir 0% mínimo en renta fija, pero si renta variable no alcanza
+    # capacidad suficiente, la renta fija debe poder completar el faltante.
+    peso_renta_variable = min(100.0 - min_fixed, max_equity, capacidad_renta_variable)
+    peso_renta_fija = 100.0 - peso_renta_variable
 
-    if peso_renta_variable > max_equity:
-        peso_renta_variable = max_equity
-        peso_renta_fija = 100.0 - peso_renta_variable
+    if peso_renta_fija < min_fixed - 0.0001:
+        peso_renta_fija = min_fixed
+        peso_renta_variable = 100.0 - peso_renta_fija
 
     if peso_renta_fija > capacidad_renta_fija + 0.0001:
         return {}
@@ -2617,18 +2696,18 @@ def construir_cartera_equiponderada_por_bloques(
     if peso_renta_variable > 0 and not tickers_renta_variable:
         return {}
 
-    pesos = {}
-
     pesos_rf = distribuir_peso_en_grupo(
         tickers_grupo=tickers_renta_fija,
         peso_total=peso_renta_fija,
         max_weight=max_weight,
+        max_weight_by_ticker=max_weight_by_ticker,
     )
 
     pesos_rv = distribuir_peso_en_grupo(
         tickers_grupo=tickers_renta_variable,
         peso_total=peso_renta_variable,
         max_weight=max_weight,
+        max_weight_by_ticker=max_weight_by_ticker,
     )
 
     if peso_renta_fija > 0 and not pesos_rf:
@@ -2637,6 +2716,7 @@ def construir_cartera_equiponderada_por_bloques(
     if peso_renta_variable > 0 and not pesos_rv:
         return {}
 
+    pesos = {}
     pesos.update(pesos_rf)
     pesos.update(pesos_rv)
 
@@ -2647,7 +2727,8 @@ def construir_cartera_equiponderada_por_bloques(
         tickers_ajustables = [
             ticker
             for ticker, peso in pesos.items()
-            if peso + diferencia <= max_weight + 0.0001 and peso + diferencia >= -0.0001
+            if peso + diferencia <= max_weight_by_ticker.get(ticker, max_weight) + 0.0001
+            and peso + diferencia >= -0.0001
         ]
 
         if tickers_ajustables:
@@ -2667,6 +2748,7 @@ def construir_cartera_equiponderada_por_bloques(
 
     return {}
 
+
 def construir_cartera_modelo_perfil(
     selected_assets: List[Dict[str, Any]],
     restricciones: Dict[str, Any],
@@ -2675,6 +2757,7 @@ def construir_cartera_modelo_perfil(
     max_equity = float(restricciones.get("max_equity_percentage", 100))
     min_fixed = float(restricciones.get("min_fixed_income_percentage", 0))
     max_weight = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_by_ticker = obtener_max_weight_por_ticker(selected_assets, restricciones)
 
     tickers_renta_fija = []
     tickers_renta_variable = []
@@ -2691,16 +2774,23 @@ def construir_cartera_modelo_perfil(
         else:
             tickers_otros.append(ticker)
 
-    peso_renta_fija = min_fixed
-    peso_renta_variable = min(100.0 - peso_renta_fija, max_equity)
+    capacidad_renta_fija = obtener_capacidad_por_tickers(tickers_renta_fija, max_weight_by_ticker, max_weight)
+    capacidad_renta_variable = obtener_capacidad_por_tickers(tickers_renta_variable, max_weight_by_ticker, max_weight)
 
-    if peso_renta_fija + peso_renta_variable < 100.0:
-        faltante = 100.0 - peso_renta_fija - peso_renta_variable
+    # Modelo de referencia: usa el mínimo de renta fija sugerido por el perfil, pero
+    # permite que renta fija complete el faltante si renta variable no tiene capacidad.
+    peso_renta_variable = min(100.0 - min_fixed, max_equity, capacidad_renta_variable)
+    peso_renta_fija = 100.0 - peso_renta_variable
 
-        if tickers_renta_fija:
-            peso_renta_fija += faltante
-        elif tickers_renta_variable:
-            peso_renta_variable += faltante
+    if peso_renta_fija < min_fixed - 0.0001:
+        peso_renta_fija = min_fixed
+        peso_renta_variable = 100.0 - peso_renta_fija
+
+    if peso_renta_fija > capacidad_renta_fija + 0.0001:
+        return {}
+
+    if peso_renta_variable > capacidad_renta_variable + 0.0001:
+        return {}
 
     pesos = {}
 
@@ -2709,6 +2799,7 @@ def construir_cartera_modelo_perfil(
             tickers_grupo=tickers_renta_fija,
             peso_total=peso_renta_fija,
             max_weight=max_weight,
+            max_weight_by_ticker=max_weight_by_ticker,
         )
     )
 
@@ -2717,6 +2808,7 @@ def construir_cartera_modelo_perfil(
             tickers_grupo=tickers_renta_variable,
             peso_total=peso_renta_variable,
             max_weight=max_weight,
+            max_weight_by_ticker=max_weight_by_ticker,
         )
     )
 
@@ -2735,38 +2827,48 @@ def generar_distribucion_aleatoria_con_limite(
     tickers_grupo: List[str],
     peso_total: float,
     max_weight: float,
+    max_weight_by_ticker: Optional[Dict[str, float]] = None,
 ) -> Optional[Dict[str, float]]:
 
     if not tickers_grupo or peso_total <= 0:
         return {}
 
-    capacidad_total = len(tickers_grupo) * max_weight
+    max_weight_by_ticker = max_weight_by_ticker or {}
+    caps = np.array([
+        float(max_weight_by_ticker.get(ticker, max_weight))
+        for ticker in tickers_grupo
+    ])
+
+    capacidad_total = float(caps.sum())
 
     if peso_total > capacidad_total + 0.0001:
         return None
 
     if abs(peso_total - capacidad_total) <= 0.0001:
         return {
-            ticker: round(max_weight, 4)
-            for ticker in tickers_grupo
+            ticker: round(float(cap), 4)
+            for ticker, cap in zip(tickers_grupo, caps)
+            if cap > 0.0001
         }
 
     n = len(tickers_grupo)
 
-    for _ in range(500):
+    for _ in range(1000):
         vector = np.random.dirichlet(np.ones(n))
         pesos = vector * peso_total
 
-        if np.all(pesos <= max_weight + 0.0001):
+        if np.all(pesos <= caps + 0.0001):
             return {
                 ticker: round(float(peso), 4)
                 for ticker, peso in zip(tickers_grupo, pesos)
+                if peso > 0.0001
             }
 
     return distribuir_peso_en_grupo(
         tickers_grupo=tickers_grupo,
         peso_total=peso_total,
         max_weight=max_weight,
+        max_weight_by_ticker=max_weight_by_ticker,
     )
 
 
@@ -2780,6 +2882,7 @@ def generar_pesos_aleatorios_restringidos(
     np.random.seed(seed)
 
     max_weight = float(restricciones.get("max_weight_per_asset", 100))
+    max_weight_by_ticker = obtener_max_weight_por_ticker(selected_assets, restricciones)
     max_equity = float(restricciones.get("max_equity_percentage", 100))
     min_fixed = float(restricciones.get("min_fixed_income_percentage", 0))
 
@@ -2800,50 +2903,42 @@ def generar_pesos_aleatorios_restringidos(
 
     candidatos = []
 
-    capacidad_renta_fija = len(tickers_renta_fija) * max_weight
-    capacidad_renta_variable = len(tickers_renta_variable) * max_weight
+    capacidad_renta_fija = obtener_capacidad_por_tickers(tickers_renta_fija, max_weight_by_ticker, max_weight)
+    capacidad_renta_variable = obtener_capacidad_por_tickers(tickers_renta_variable, max_weight_by_ticker, max_weight)
 
     if capacidad_renta_fija < min_fixed - 0.0001:
         return []
 
-    if capacidad_renta_variable < (100 - min_fixed) - 0.0001:
+    # Si renta variable no puede completar el 100%, renta fija debe poder completar
+    # el faltante. Esto evita que Monte Carlo quede en cero por usar límites demasiado rígidos.
+    min_fixed_required_by_equity_capacity = max(
+        min_fixed,
+        100.0 - min(max_equity, capacidad_renta_variable),
+    )
+
+    max_fixed_possible = min(100.0, capacidad_renta_fija)
+
+    if min_fixed_required_by_equity_capacity > max_fixed_possible + 0.0001:
         return []
 
-    intentos_maximos = cantidad * 20
+    intentos_maximos = max(cantidad * 30, 5000)
     intentos = 0
 
     while len(candidatos) < cantidad and intentos < intentos_maximos:
         intentos += 1
 
-        min_fixed_possible = min_fixed
-        max_fixed_possible = min(
-            100.0,
-            capacidad_renta_fija,
-            100.0
-        )
-
-        min_fixed_required_by_equity_capacity = max(
-            min_fixed_possible,
-            100.0 - min(max_equity, capacidad_renta_variable)
-        )
-
-        max_fixed_allowed_by_equity_minimum = min(
-            max_fixed_possible,
-            100.0
-        )
-
-        if min_fixed_required_by_equity_capacity > max_fixed_allowed_by_equity_minimum + 0.0001:
-            return []
-
-        if abs(min_fixed_required_by_equity_capacity - max_fixed_allowed_by_equity_minimum) <= 0.0001:
+        if abs(min_fixed_required_by_equity_capacity - max_fixed_possible) <= 0.0001:
             peso_renta_fija = min_fixed_required_by_equity_capacity
         else:
-            peso_renta_fija = np.random.uniform(
+            peso_renta_fija = float(np.random.uniform(
                 min_fixed_required_by_equity_capacity,
-                max_fixed_allowed_by_equity_minimum
-            )
+                max_fixed_possible,
+            ))
 
         peso_renta_variable = 100.0 - peso_renta_fija
+
+        if peso_renta_variable < -0.0001:
+            continue
 
         if peso_renta_variable > max_equity + 0.0001:
             continue
@@ -2855,12 +2950,14 @@ def generar_pesos_aleatorios_restringidos(
             tickers_grupo=tickers_renta_fija,
             peso_total=peso_renta_fija,
             max_weight=max_weight,
+            max_weight_by_ticker=max_weight_by_ticker,
         )
 
         pesos_rv = generar_distribucion_aleatoria_con_limite(
             tickers_grupo=tickers_renta_variable,
             peso_total=peso_renta_variable,
             max_weight=max_weight,
+            max_weight_by_ticker=max_weight_by_ticker,
         )
 
         if pesos_rf is None or pesos_rv is None:
@@ -2875,15 +2972,13 @@ def generar_pesos_aleatorios_restringidos(
 
         total = sum(pesos.values())
 
-        if abs(total - 100.0) > 0.05:
-            continue
-
         diferencia = 100.0 - total
 
         if abs(diferencia) > 0.0001:
             tickers_ajustables = [
                 ticker for ticker, peso in pesos.items()
-                if peso + diferencia <= max_weight + 0.0001 and peso + diferencia >= -0.0001
+                if peso + diferencia <= max_weight_by_ticker.get(ticker, max_weight) + 0.0001
+                and peso + diferencia >= -0.0001
             ]
 
             if tickers_ajustables:
@@ -3363,7 +3458,9 @@ def comparar_carteras_academicas(request: PortfolioCompareRequest):
             "timeframe": request.timeframe,
             "annualization_factor": factor,
             "risk_free_rate": risk_free_rate,
+            "monte_carlo_portfolios_requested": cantidad_mc,
             "monte_carlo_portfolios": len(candidatos),
+            "monte_carlo_portfolios_evaluated": len(seleccion_mc.get("evaluadas", [])),
             "return_method": "log_returns",
         },
         "fecha_inicio": str(precios.index.min().date()),
@@ -3374,6 +3471,12 @@ def comparar_carteras_academicas(request: PortfolioCompareRequest):
         "risk_return_points": risk_return_points,
         "best_by_criteria": best_by_criteria,
         "academic_interpretation": generar_interpretacion_comparador(portfolios),
+        "diagnostico_monte_carlo": {
+            "candidatos_generados": len(candidatos),
+            "candidatos_evaluados": len(seleccion_mc.get("evaluadas", [])),
+            "ids_portfolios_generados": [portfolio.get("id") for portfolio in portfolios],
+            "max_weight_por_ticker": obtener_max_weight_por_ticker(request.selected_assets, restricciones),
+        },
         "advertencia": (
             "Las carteras comparadas tienen finalidad académica y se construyen con base en datos "
             "históricos y restricciones del perfil. No constituyen asesoría financiera personalizada, "
