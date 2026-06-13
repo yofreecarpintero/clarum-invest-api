@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.13",
+    version="0.2.14",
 )
 
 app.add_middleware(
@@ -761,7 +761,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.13",
+        "version": "0.2.14",
     }
 
 
@@ -770,7 +770,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.13",
+        "version": "0.2.14",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1465,7 +1465,9 @@ def calcular_metricas_individuales_activo(
     # Para N retornos se necesitan N + 1 precios.
     precios_ventana = serie.tail(lookback_observations + 1)
 
-    retornos = precios_ventana.pct_change().dropna()
+    # Retornos logarítmicos.
+    # Se usan para rentabilidad, volatilidad, VaR y CVaR del activo.
+    retornos = np.log(precios_ventana / precios_ventana.shift(1)).dropna()
     retornos = retornos.tail(lookback_observations)
 
     if retornos.empty or len(retornos) < 60:
@@ -1485,6 +1487,18 @@ def calcular_metricas_individuales_activo(
 
     if precios_drawdown.empty or len(precios_drawdown) < 2:
         precios_drawdown = precios_ventana.tail(len(retornos) + 1)
+
+    rentabilidad_log_anualizada = float(retornos.mean() * 252)
+    rentabilidad_log_acumulada = float(retornos.sum())
+
+    precio_inicial = float(precios_ventana.iloc[0])
+    precio_final = float(precios_ventana.iloc[-1])
+
+    rentabilidad_simple_acumulada = (
+    (precio_final / precio_inicial) - 1
+    if precio_inicial > 0
+    else None
+    )
 
     volatilidad_anualizada = float(retornos.std(ddof=1) * np.sqrt(252))
 
@@ -1508,16 +1522,32 @@ def calcular_metricas_individuales_activo(
         "observations": int(len(retornos)),
         "start_date": str(retornos.index.min().date()),
         "end_date": str(retornos.index.max().date()),
+
+        # Rentabilidad calculada con retornos logarítmicos.
+        "annualized_log_return": round(rentabilidad_log_anualizada, 6),
+        "cumulative_log_return": round(rentabilidad_log_acumulada, 6),
+
+        # Rentabilidad acumulada simple equivalente para lectura del usuario.
+        "cumulative_simple_return": (
+        round(float(rentabilidad_simple_acumulada), 6)
+        if rentabilidad_simple_acumulada is not None
+        else None
+        ),
+
+        # Riesgo calculado sobre retornos logarítmicos.
         "annualized_volatility": round(volatilidad_anualizada, 6),
 
         # Se devuelven negativos porque representan pérdida.
         "var_95_daily": round(var_daily, 6),
         "cvar_95_daily": round(cvar_daily, 6),
+
+        # Drawdown calculado sobre la serie de precios.
         "max_drawdown_250d": round(max_drawdown, 6),
 
         "last_price": round(float(serie.iloc[-1]), 6),
         "price_source": fuente,
         "data_source": "backend_historical_prices",
+        "return_method": "log_returns",
     }
 
 
