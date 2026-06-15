@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.18",
+    version="0.2.19",
 )
 
 app.add_middleware(
@@ -770,7 +770,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.18",
+        "version": "0.2.19",
     }
 
 
@@ -779,7 +779,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.18",
+        "version": "0.2.19",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -2093,12 +2093,169 @@ class PortfolioSimulationRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     timeframe: Optional[str] = "diario"
+    frequency: Optional[str] = None
     risk_free_rate: Optional[float] = 0.0
     risk_free_rate_annual: Optional[float] = None
+    basket_name: Optional[str] = None
+    portfolio_mode: Optional[str] = None
+    simulation_mode: Optional[str] = None
+    skip_academic_validation: Optional[bool] = False
+
+
+def normalizar_timeframe_simulacion(timeframe: Optional[str]) -> str:
+    """Convierte los marcos temporales del frontend a los nombres usados por Python."""
+
+    tf = str(timeframe or "diario").strip().lower()
+
+    alias = {
+        "1d": "diario",
+        "day": "diario",
+        "daily": "diario",
+        "diaria": "diario",
+        "diario": "diario",
+        "week": "semanal",
+        "weekly": "semanal",
+        "semanal": "semanal",
+        "biweekly": "quincenal",
+        "quincenal": "quincenal",
+        "month": "mensual",
+        "monthly": "mensual",
+        "mensual": "mensual",
+        "quarter": "trimestral",
+        "quarterly": "trimestral",
+        "trimestral": "trimestral",
+        "semester": "semestral",
+        "semiannual": "semestral",
+        "semestral": "semestral",
+        "year": "anual",
+        "yearly": "anual",
+        "annual": "anual",
+        "anual": "anual",
+    }
+
+    return alias.get(tf, tf or "diario")
+
+
+def normalizar_modo_portafolio(valor: Optional[str]) -> str:
+    modo = str(valor or "").strip().lower()
+    alias_libre = {
+        "unrestricted",
+        "free",
+        "free_portfolio",
+        "portfolio_free",
+        "sin_restriccion",
+        "sin restricciones",
+        "sin-restriccion",
+        "libre",
+        "modo_libre",
+    }
+    return "unrestricted" if modo in alias_libre else "academic_restricted"
+
+
+def es_modo_portafolio_libre(request: PortfolioSimulationRequest) -> bool:
+    return bool(
+        request.skip_academic_validation
+        or normalizar_modo_portafolio(request.portfolio_mode) == "unrestricted"
+        or normalizar_modo_portafolio(request.simulation_mode) == "unrestricted"
+        or str(request.simulation_mode or "").strip().lower() == "free_portfolio"
+    )
+
+
+def validar_portafolio_libre_para_simulacion(request: PortfolioSimulationRequest) -> Dict[str, Any]:
+    """
+    Validación mínima para el modo Portafolio libre.
+
+    No aplica semáforo académico, mínimo de renta fija, máximo de renta variable,
+    máximo por activo ni clases bloqueadas. Solo verifica que el portafolio pueda
+    simularse con datos históricos.
+    """
+
+    errors: List[str] = []
+    warnings: List[str] = []
+    activos_validados: List[Dict[str, Any]] = []
+
+    if not request.selected_assets:
+        errors.append("Debes seleccionar al menos un activo para simular el portafolio libre.")
+
+    pesos = normalizar_pesos_portafolio(
+        selected_assets=request.selected_assets,
+        weights=request.weights,
+    ) if request.selected_assets else {}
+
+    total_weight = round(sum(float(v or 0) for v in pesos.values()), 4)
+
+    if abs(total_weight - 100.0) > 0.01:
+        errors.append(f"La suma de pesos debe ser 100%. Actualmente suma {total_weight}%.")
+
+    tickers_datos: List[str] = []
+    renta_fija = 0.0
+    renta_variable = 0.0
+
+    for asset in request.selected_assets:
+        ticker_visible = obtener_ticker_visible(asset)
+        ticker_datos = obtener_ticker_datos(asset)
+        catalog_asset = validar_activo_con_catalogo_o_payload(asset)
+        peso = float(pesos.get(ticker_visible, 0.0))
+
+        if not ticker_visible:
+            errors.append("Uno de los activos no tiene ticker visible.")
+            continue
+
+        if peso < 0:
+            errors.append(f"El peso del activo {ticker_visible} no puede ser negativo.")
+
+        if not ticker_datos:
+            errors.append(f"El activo {ticker_visible} no tiene símbolo yfinance configurado.")
+
+        if not catalog_asset:
+            errors.append(
+                f"No fue posible validar el activo {ticker_visible} porque no existe en el catálogo "
+                "interno ni llegó con snapshot oficial de Supabase."
+            )
+            continue
+
+        if ticker_datos:
+            tickers_datos.append(ticker_datos)
+
+        clase_general = obtener_clase_general_activo(catalog_asset.get("asset_class", ""))
+        if clase_general == "renta_fija":
+            renta_fija += peso
+        elif clase_general == "renta_variable":
+            renta_variable += peso
+
+        activos_validados.append({
+            **catalog_asset,
+            "assigned_weight": round(peso, 4),
+            "general_class": clase_general,
+            "validation_mode": "unrestricted",
+        })
+
+    if len(set(tickers_datos)) != len(tickers_datos):
+        errors.append("Existen activos con el mismo símbolo yfinance. Revisa el catálogo académico.")
+
+    return {
+        "is_valid": len(errors) == 0,
+        "validation_mode": "unrestricted",
+        "calculation_source": "backend_free_validation",
+        "errors": errors,
+        "warnings": warnings,
+        "activos_validados": activos_validados,
+        "resumen": {
+            "total_weight": total_weight,
+            "fixed_income_percentage": round(renta_fija, 4),
+            "equity_percentage": round(renta_variable, 4),
+            "asset_count": len(request.selected_assets),
+        },
+        "mensaje": (
+            "Portafolio libre válido para simulación histórica."
+            if len(errors) == 0
+            else "El portafolio libre necesita ajustes antes de simularse."
+        ),
+    }
 
 
 def obtener_factor_anualizacion(timeframe: str) -> int:
-    tf = str(timeframe).strip().lower()
+    tf = normalizar_timeframe_simulacion(timeframe)
 
     factores = {
         "diario": 252,
@@ -2114,7 +2271,7 @@ def obtener_factor_anualizacion(timeframe: str) -> int:
 
 
 def obtener_regla_resample(timeframe: str):
-    tf = str(timeframe).strip().lower()
+    tf = normalizar_timeframe_simulacion(timeframe)
 
     reglas = {
         "diario": None,
@@ -2204,8 +2361,8 @@ def descargar_precios_yfinance_simulacion(
 
 
 def aplicar_marco_temporal(precios: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    regla = obtener_regla_resample(timeframe)
-    tf = str(timeframe).strip().lower()
+    tf = normalizar_timeframe_simulacion(timeframe)
+    regla = obtener_regla_resample(tf)
 
     if regla is None:
         return precios
@@ -2284,22 +2441,30 @@ def generar_explicacion_simulacion(
 @app.post("/api/portfolio/simulate")
 def simular_portafolio_academico(request: PortfolioSimulationRequest):
 
-    validacion = validar_portafolio_academico(
-        PortfolioValidationRequest(
-            resultado=request.resultado,
-            selected_assets=request.selected_assets,
-            weights=request.weights,
+    modo_libre = es_modo_portafolio_libre(request)
+    timeframe_normalizado = normalizar_timeframe_simulacion(request.timeframe or request.frequency or "diario")
+
+    if modo_libre:
+        validacion = validar_portafolio_libre_para_simulacion(request)
+    else:
+        validacion = validar_portafolio_academico(
+            PortfolioValidationRequest(
+                resultado=request.resultado,
+                selected_assets=request.selected_assets,
+                weights=request.weights,
+            )
         )
-    )
 
     if not validacion.get("is_valid"):
         return {
             "status": "error",
             "modulo": "portfolio-simulate",
+            "portfolio_mode": "unrestricted" if modo_libre else "academic_restricted",
             "validation": validacion,
             "mensaje": (
-                "El portafolio no puede simularse porque no cumple las restricciones "
-                "académicas del perfil."
+                "El portafolio libre no puede simularse porque necesita ajustes básicos."
+                if modo_libre
+                else "El portafolio no puede simularse porque no cumple las restricciones académicas del perfil."
             ),
         }
 
@@ -2383,7 +2548,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         )
 
     precios = precios[columnas_disponibles].dropna()
-    precios = aplicar_marco_temporal(precios, request.timeframe or "diario")
+    precios = aplicar_marco_temporal(precios, timeframe_normalizado)
 
     # Retornos logarítmicos del periodo seleccionado por el usuario.
     # Rentabilidad, volatilidad, VaR, CVaR, correlación, Sharpe y métricas individuales
@@ -2396,7 +2561,7 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
             detail="No fue posible calcular retornos logarítmicos para la simulación.",
         )
 
-    factor = obtener_factor_anualizacion(request.timeframe or "diario")
+    factor = obtener_factor_anualizacion(timeframe_normalizado)
     retornos_portafolio = retornos.dot(pesos)
 
     rentabilidad_anual = float(retornos_portafolio.mean() * factor)
@@ -2506,13 +2671,16 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         max_drawdown=max_drawdown,
         var_95=var_95,
         cvar_95=cvar_95,
-        timeframe=request.timeframe or "diario",
+        timeframe=timeframe_normalizado,
         activos=tickers_visibles,
     )
 
     respuesta = {
         "status": "ok",
         "modulo": "portfolio-simulate",
+        "portfolio_mode": "unrestricted" if modo_libre else "academic_restricted",
+        "simulation_mode": request.simulation_mode or ("free_portfolio" if modo_libre else "historical_data"),
+        "basket_name": request.basket_name,
         "validation": validacion,
         "activos": activos_detalle,
         "pesos_utilizados": pesos_utilizados,
@@ -2520,7 +2688,8 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
             "period": request.period,
             "start_date": request.start_date,
             "end_date": request.end_date,
-            "timeframe": request.timeframe,
+            "timeframe": timeframe_normalizado,
+            "timeframe_requested": request.timeframe,
             "annualization_factor": factor,
             "risk_free_rate": risk_free_rate,
             "risk_free_rate_annual_used": risk_free_rate,
@@ -2550,8 +2719,11 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         "drawdown_series": drawdown_series,
         "explicacion_lenguaje_natural": explicacion,
         "advertencia": (
-            "Los cálculos se basan en datos históricos y tienen finalidad académica. "
-            "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
+            "Modo portafolio libre: esta simulación no aplica restricciones del semáforo académico. "
+            "Los cálculos se basan en datos históricos y tienen finalidad educativa; no constituyen asesoría financiera personalizada."
+            if modo_libre
+            else "Los cálculos se basan en datos históricos y tienen finalidad académica. "
+                 "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
         ),
     }
 
@@ -3661,7 +3833,8 @@ def comparar_carteras_academicas(request: PortfolioCompareRequest):
             "period": request.period,
             "start_date": request.start_date,
             "end_date": request.end_date,
-            "timeframe": request.timeframe,
+            "timeframe": timeframe_normalizado,
+            "timeframe_requested": request.timeframe,
             "annualization_factor": factor,
             "risk_free_rate": risk_free_rate,
             "monte_carlo_portfolios_requested": cantidad_mc,
