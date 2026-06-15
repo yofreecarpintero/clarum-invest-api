@@ -16,7 +16,7 @@ from pydantic import BaseModel
 app = FastAPI(
     title="CLARUM Invest API",
     description="Backend académico en Python para cálculos financieros de CLARUM Invest.",
-    version="0.2.17",
+    version="0.2.18",
 )
 
 app.add_middleware(
@@ -770,7 +770,7 @@ def inicio():
     return {
         "mensaje": "CLARUM Invest API está funcionando correctamente.",
         "estado": "ok",
-        "version": "0.2.17",
+        "version": "0.2.18",
     }
 
 
@@ -779,7 +779,7 @@ def health():
     return {
         "status": "ok",
         "servicio": "CLARUM Invest API",
-        "version": "0.2.17",
+        "version": "0.2.18",
         "fecha_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1714,14 +1714,135 @@ def obtener_clase_general_activo(asset_class: str) -> str:
     return "otro"
 
 
+def limpiar_ticker_backend(valor: Any) -> str:
+    """Normaliza tickers sin asumir que todos vienen del catálogo interno."""
+
+    return str(valor or "").strip().upper()
+
+
+def obtener_ticker_visible(asset: Dict[str, Any]) -> str:
+    """Ticker académico que se muestra al usuario en CLARUM Invest."""
+
+    return limpiar_ticker_backend(
+        asset.get("display_ticker")
+        or asset.get("academic_ticker")
+        or asset.get("ticker")
+    )
+
+
+def obtener_ticker_datos(asset: Dict[str, Any]) -> str:
+    """Ticker técnico usado para descargar datos históricos en yfinance."""
+
+    return limpiar_ticker_backend(
+        asset.get("yfinance_symbol")
+        or asset.get("symbol_yfinance")
+        or asset.get("ticker")
+    )
+
+
 def validar_activo_con_catalogo(ticker: str) -> Optional[Dict[str, Any]]:
-    ticker_norm = str(ticker).strip().upper()
+    ticker_norm = limpiar_ticker_backend(ticker)
 
     for activo in ASSET_CATALOG:
-        if activo["ticker"].upper() == ticker_norm:
+        if limpiar_ticker_backend(activo.get("ticker")) == ticker_norm:
             return activo
 
     return None
+
+
+def validar_activo_con_catalogo_o_payload(asset: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Valida un activo contra el catálogo interno o contra el snapshot oficial
+    que envía Lovable desde Supabase.
+
+    Esto permite que activos cargados por el Superadministrador, como GOOG o BBVA,
+    puedan validarse y simularse aunque todavía no estén escritos en ASSET_CATALOG.
+    """
+
+    ticker_visible = obtener_ticker_visible(asset)
+    ticker_datos = obtener_ticker_datos(asset)
+
+    catalog_asset = (
+        validar_activo_con_catalogo(ticker_visible)
+        or validar_activo_con_catalogo(ticker_datos)
+    )
+
+    if catalog_asset:
+        return {
+            **catalog_asset,
+            "ticker": ticker_visible or limpiar_ticker_backend(catalog_asset.get("ticker")),
+            "yfinance_symbol": ticker_datos or limpiar_ticker_backend(catalog_asset.get("ticker")),
+            "source": catalog_asset.get("source") or catalog_asset.get("data_source") or "backend_catalog",
+        }
+
+    source = str(asset.get("source") or asset.get("data_source") or "").strip().lower()
+    has_supabase_source = source == "supabase_catalog"
+    has_catalog_identity = bool(
+        asset.get("asset_id")
+        or asset.get("id_activo")
+        or asset.get("catalog_version_id")
+        or asset.get("id_version_catalogo")
+    )
+
+    has_required_snapshot = all([
+        ticker_visible,
+        asset.get("name"),
+        asset.get("asset_class"),
+        asset.get("asset_type"),
+        ticker_datos,
+    ])
+
+    if has_required_snapshot and (has_supabase_source or has_catalog_identity):
+        return {
+            "ticker": ticker_visible,
+            "yfinance_symbol": ticker_datos,
+            "name": asset.get("name"),
+            "asset_class": asset.get("asset_class"),
+            "asset_type": asset.get("asset_type"),
+            "asset_subclass": asset.get("asset_subclass"),
+            "risk_level": asset.get("risk_level"),
+            "complexity": asset.get("complexity") or asset.get("complexity_level"),
+            "currency": asset.get("currency", "USD"),
+            "region": asset.get("region"),
+            "country": asset.get("country"),
+            "sector": asset.get("sector"),
+            "issuer": asset.get("issuer"),
+            "description": asset.get("description"),
+            "academic_note": asset.get("academic_note"),
+            "source": "supabase_catalog",
+            "data_source": "supabase_catalog",
+            "asset_id": asset.get("asset_id") or asset.get("id_activo"),
+            "catalog_version_id": asset.get("catalog_version_id") or asset.get("id_version_catalogo"),
+        }
+
+    return None
+
+
+def obtener_peso_para_activo(
+    asset: Dict[str, Any],
+    weights: Dict[str, float],
+) -> float:
+    ticker_visible = obtener_ticker_visible(asset)
+    ticker_datos = obtener_ticker_datos(asset)
+
+    posibles_claves = [
+        ticker_visible,
+        ticker_datos,
+        limpiar_ticker_backend(asset.get("ticker")),
+        limpiar_ticker_backend(asset.get("academic_ticker")),
+        limpiar_ticker_backend(asset.get("display_ticker")),
+        limpiar_ticker_backend(asset.get("yfinance_symbol")),
+        ticker_visible.lower(),
+        ticker_datos.lower(),
+        str(asset.get("ticker", "")).strip(),
+        str(asset.get("yfinance_symbol", "")).strip(),
+    ]
+
+    for clave in posibles_claves:
+        if clave and clave in weights:
+            return float(weights.get(clave, 0))
+
+    return 0.0
 
 
 def normalizar_pesos_portafolio(
@@ -1729,32 +1850,39 @@ def normalizar_pesos_portafolio(
     weights: Optional[Dict[str, float]],
 ) -> Dict[str, float]:
 
-    tickers = [str(asset.get("ticker", "")).upper() for asset in selected_assets]
+    tickers_visibles = [
+        obtener_ticker_visible(asset)
+        for asset in selected_assets
+        if obtener_ticker_visible(asset)
+    ]
+
+    if not tickers_visibles:
+        raise HTTPException(
+            status_code=400,
+            detail="No se encontraron tickers válidos en los activos seleccionados.",
+        )
 
     if not weights:
-        peso_igual = round(100 / len(tickers), 6)
-        return {ticker: peso_igual for ticker in tickers}
+        peso_igual = round(100 / len(tickers_visibles), 6)
+        return {ticker: peso_igual for ticker in tickers_visibles}
 
     pesos_limpios = {}
 
-    for ticker in tickers:
-        peso = weights.get(ticker)
+    for asset in selected_assets:
+        ticker_visible = obtener_ticker_visible(asset)
 
-        if peso is None:
-            peso = weights.get(ticker.lower())
-
-        if peso is None:
-            peso = 0
+        if not ticker_visible:
+            continue
 
         try:
-            peso_float = float(peso)
+            peso_float = obtener_peso_para_activo(asset, weights)
         except Exception:
             raise HTTPException(
                 status_code=400,
-                detail=f"El peso del activo {ticker} no es un número válido.",
+                detail=f"El peso del activo {ticker_visible} no es un número válido.",
             )
 
-        pesos_limpios[ticker] = peso_float
+        pesos_limpios[ticker_visible] = peso_float
 
     return pesos_limpios
 
@@ -1831,17 +1959,18 @@ def validar_portafolio_academico(request: PortfolioValidationRequest):
     activos_validados = []
 
     for asset in request.selected_assets:
-        ticker = str(asset.get("ticker", "")).upper().strip()
+        ticker = obtener_ticker_visible(asset)
 
         if not ticker:
             errors.append("Existe un activo seleccionado sin ticker.")
             continue
 
-        catalog_asset = validar_activo_con_catalogo(ticker)
+        catalog_asset = validar_activo_con_catalogo_o_payload(asset)
 
         if not catalog_asset:
             errors.append(
-                f"El activo {ticker} no existe en el catálogo maestro académico."
+                f"No fue posible validar el activo {ticker} porque no existe en el catálogo "
+                "interno ni llegó con snapshot oficial de Supabase."
             )
             continue
 
@@ -1860,6 +1989,10 @@ def validar_portafolio_academico(request: PortfolioValidationRequest):
             )
 
         max_weight_asset = float(asset.get("max_weight_allowed", max_weight_per_asset))
+
+        # El máximo efectivo nunca debe superar el límite del semáforo académico.
+        if max_weight_per_asset > 0:
+            max_weight_asset = min(max_weight_asset, max_weight_per_asset)
 
         if asset_class == "Acciones individuales de alta volatilidad":
             max_weight_asset = min(max_weight_asset, 10)
@@ -2170,26 +2303,57 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
             ),
         }
 
-    tickers = [
-        str(asset.get("ticker", "")).upper().strip()
-        for asset in request.selected_assets
-        if str(asset.get("ticker", "")).strip()
-    ]
+    activos_simulacion = []
 
-    if not tickers:
+    for asset in request.selected_assets:
+        ticker_visible = obtener_ticker_visible(asset)
+        ticker_datos = obtener_ticker_datos(asset)
+        catalog_asset = validar_activo_con_catalogo_o_payload(asset)
+
+        if not ticker_visible or not ticker_datos:
+            raise HTTPException(
+                status_code=400,
+                detail="No se encontraron tickers válidos para la simulación.",
+            )
+
+        if not catalog_asset:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No fue posible simular el activo {ticker_visible} porque no existe "
+                    "en el catálogo interno ni llegó con snapshot oficial de Supabase."
+                ),
+            )
+
+        activos_simulacion.append({
+            "asset": asset,
+            "catalog_asset": catalog_asset,
+            "ticker_visible": ticker_visible,
+            "ticker_datos": ticker_datos,
+        })
+
+    tickers_datos = [item["ticker_datos"] for item in activos_simulacion]
+    tickers_visibles = [item["ticker_visible"] for item in activos_simulacion]
+
+    if len(set(tickers_datos)) != len(tickers_datos):
         raise HTTPException(
             status_code=400,
-            detail="No se encontraron tickers válidos para la simulación.",
+            detail="Existen activos con el mismo símbolo yfinance. Revisa el catálogo académico.",
         )
 
-    pesos_pct = {
-        str(ticker).upper(): float(peso)
-        for ticker, peso in request.weights.items()
+    pesos_visibles = normalizar_pesos_portafolio(
+        selected_assets=request.selected_assets,
+        weights=request.weights,
+    )
+
+    pesos_pct_datos = {
+        item["ticker_datos"]: float(pesos_visibles.get(item["ticker_visible"], 0.0))
+        for item in activos_simulacion
     }
 
     pesos = np.array([
-        pesos_pct.get(ticker, 0) / 100
-        for ticker in tickers
+        pesos_pct_datos.get(ticker, 0.0) / 100.0
+        for ticker in tickers_datos
     ])
 
     if abs(pesos.sum() - 1.0) > 0.001:
@@ -2199,13 +2363,26 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         )
 
     precios = descargar_precios_yfinance_simulacion(
-        tickers=tickers,
+        tickers=tickers_datos,
         period=request.period or "2y",
         start_date=request.start_date,
         end_date=request.end_date,
     )
 
-    precios = precios[tickers].dropna()
+    columnas_disponibles = [ticker for ticker in tickers_datos if ticker in precios.columns]
+    columnas_faltantes = [ticker for ticker in tickers_datos if ticker not in precios.columns]
+
+    if columnas_faltantes:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No se descargaron datos históricos para: "
+                + ", ".join(columnas_faltantes)
+                + ". Revisa el símbolo yfinance en el catálogo académico."
+            ),
+        )
+
+    precios = precios[columnas_disponibles].dropna()
     precios = aplicar_marco_temporal(precios, request.timeframe or "diario")
 
     # Retornos logarítmicos del periodo seleccionado por el usuario.
@@ -2251,10 +2428,31 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
     retornos_cola = retornos_portafolio[retornos_portafolio <= percentil_5]
     cvar_95 = float(retornos_cola.mean()) if len(retornos_cola) > 0 else var_95
 
-    correlacion = retornos.corr().round(4).to_dict()
+    ticker_visible_por_dato = {
+        item["ticker_datos"]: item["ticker_visible"]
+        for item in activos_simulacion
+    }
 
-    rentabilidades_individuales = (retornos.mean() * factor).round(6).to_dict()
-    volatilidades_individuales = (retornos.std() * np.sqrt(factor)).round(6).to_dict()
+    correlacion_datos = retornos.corr().round(4).to_dict()
+    correlacion = {
+        ticker_visible_por_dato.get(ticker_fila, ticker_fila): {
+            ticker_visible_por_dato.get(ticker_col, ticker_col): valor
+            for ticker_col, valor in columnas.items()
+        }
+        for ticker_fila, columnas in correlacion_datos.items()
+    }
+
+    rentabilidades_datos = (retornos.mean() * factor).round(6).to_dict()
+    volatilidades_datos = (retornos.std() * np.sqrt(factor)).round(6).to_dict()
+
+    rentabilidades_individuales = {
+        ticker_visible_por_dato.get(ticker, ticker): valor
+        for ticker, valor in rentabilidades_datos.items()
+    }
+    volatilidades_individuales = {
+        ticker_visible_por_dato.get(ticker, ticker): valor
+        for ticker, valor in volatilidades_datos.items()
+    }
 
     performance_series = [
         {
@@ -2273,27 +2471,32 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
     ]
 
     pesos_utilizados = {
-        ticker: round(float(pesos_pct.get(ticker, 0)), 4)
-        for ticker in tickers
+        item["ticker_visible"]: round(float(pesos_visibles.get(item["ticker_visible"], 0.0)), 4)
+        for item in activos_simulacion
     }
 
     activos_detalle = []
 
-    for asset in request.selected_assets:
-        ticker = str(asset.get("ticker", "")).upper().strip()
-
-        catalog_asset = validar_activo_con_catalogo(ticker)
+    for item in activos_simulacion:
+        asset = item["asset"]
+        catalog_asset = item["catalog_asset"]
+        ticker_visible = item["ticker_visible"]
+        ticker_datos = item["ticker_datos"]
 
         activos_detalle.append({
-            "ticker": ticker,
-            "name": asset.get("name") or (catalog_asset or {}).get("name"),
-            "asset_class": asset.get("asset_class") or (catalog_asset or {}).get("asset_class"),
-            "asset_type": asset.get("asset_type") or (catalog_asset or {}).get("asset_type"),
-            "risk_level": asset.get("risk_level") or (catalog_asset or {}).get("risk_level"),
-            "complexity": asset.get("complexity") or (catalog_asset or {}).get("complexity"),
-            "weight": pesos_utilizados.get(ticker, 0),
-            "rentabilidad_anualizada": rentabilidades_individuales.get(ticker),
-            "volatilidad_anualizada": volatilidades_individuales.get(ticker),
+            "ticker": ticker_visible,
+            "yfinance_symbol": ticker_datos,
+            "name": asset.get("name") or catalog_asset.get("name"),
+            "asset_class": asset.get("asset_class") or catalog_asset.get("asset_class"),
+            "asset_type": asset.get("asset_type") or catalog_asset.get("asset_type"),
+            "asset_id": asset.get("asset_id") or catalog_asset.get("asset_id"),
+            "catalog_version_id": asset.get("catalog_version_id") or catalog_asset.get("catalog_version_id"),
+            "risk_level": asset.get("risk_level") or catalog_asset.get("risk_level"),
+            "complexity": asset.get("complexity") or asset.get("complexity_level") or catalog_asset.get("complexity"),
+            "source": catalog_asset.get("source") or catalog_asset.get("data_source"),
+            "weight": pesos_utilizados.get(ticker_visible, 0),
+            "rentabilidad_anualizada": rentabilidades_datos.get(ticker_datos),
+            "volatilidad_anualizada": volatilidades_datos.get(ticker_datos),
         })
 
     explicacion = generar_explicacion_simulacion(
@@ -2304,50 +2507,52 @@ def simular_portafolio_academico(request: PortfolioSimulationRequest):
         var_95=var_95,
         cvar_95=cvar_95,
         timeframe=request.timeframe or "diario",
-        activos=tickers,
+        activos=tickers_visibles,
     )
 
     respuesta = {
-    "status": "ok",
-    "modulo": "portfolio-simulate",
-    "validation": validacion,
-    "activos": activos_detalle,
-    "pesos_utilizados": pesos_utilizados,
-    "parametros": {
-        "period": request.period,
-        "start_date": request.start_date,
-        "end_date": request.end_date,
-        "timeframe": request.timeframe,
-        "annualization_factor": factor,
-        "risk_free_rate": risk_free_rate,
-        "risk_free_rate_annual_used": risk_free_rate,
-        "return_method": "log_returns",
-    },
-    "fecha_inicio": str(precios.index.min().date()),
-    "fecha_fin": str(precios.index.max().date()),
-    "numero_observaciones": int(len(precios)),
-    "metricas_portafolio": {
-        "rentabilidad_anualizada": round(rentabilidad_anual, 6),
-        "volatilidad_anualizada": round(volatilidad_anual, 6),
-        "sharpe_ratio": round(float(sharpe_ratio), 6),
-        "max_drawdown": round(max_drawdown, 6),
-        "var_95_historico": round(var_95, 6),
-        "cvar_95_historico": round(cvar_95, 6),
-        "return_method": "log_returns",
-    },
-    "metricas_individuales": {
-        "rentabilidad_anualizada": rentabilidades_individuales,
-        "volatilidad_anualizada": volatilidades_individuales,
-        "return_method": "log_returns",
-    },
-    "matriz_correlacion": correlacion,
-    "performance_series": performance_series,
-    "drawdown_series": drawdown_series,
-    "explicacion_lenguaje_natural": explicacion,
-    "advertencia": (
-        "Los cálculos se basan en datos históricos y tienen finalidad académica. "
-        "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
-    ),
+        "status": "ok",
+        "modulo": "portfolio-simulate",
+        "validation": validacion,
+        "activos": activos_detalle,
+        "pesos_utilizados": pesos_utilizados,
+        "parametros": {
+            "period": request.period,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "timeframe": request.timeframe,
+            "annualization_factor": factor,
+            "risk_free_rate": risk_free_rate,
+            "risk_free_rate_annual_used": risk_free_rate,
+            "return_method": "log_returns",
+            "tickers_visibles": tickers_visibles,
+            "tickers_yfinance": tickers_datos,
+        },
+        "fecha_inicio": str(precios.index.min().date()),
+        "fecha_fin": str(precios.index.max().date()),
+        "numero_observaciones": int(len(precios)),
+        "metricas_portafolio": {
+            "rentabilidad_anualizada": round(rentabilidad_anual, 6),
+            "volatilidad_anualizada": round(volatilidad_anual, 6),
+            "sharpe_ratio": round(float(sharpe_ratio), 6),
+            "max_drawdown": round(max_drawdown, 6),
+            "var_95_historico": round(var_95, 6),
+            "cvar_95_historico": round(cvar_95, 6),
+            "return_method": "log_returns",
+        },
+        "metricas_individuales": {
+            "rentabilidad_anualizada": rentabilidades_individuales,
+            "volatilidad_anualizada": volatilidades_individuales,
+            "return_method": "log_returns",
+        },
+        "matriz_correlacion": correlacion,
+        "performance_series": performance_series,
+        "drawdown_series": drawdown_series,
+        "explicacion_lenguaje_natural": explicacion,
+        "advertencia": (
+            "Los cálculos se basan en datos históricos y tienen finalidad académica. "
+            "No constituyen asesoría financiera personalizada ni garantizan resultados futuros."
+        ),
     }
 
     return limpiar_valores_json(respuesta)
